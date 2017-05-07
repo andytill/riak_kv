@@ -86,6 +86,7 @@
 -include_lib("riak_core_pb.hrl").
 -include_lib("riak_ql/include/riak_ql_ddl.hrl").
 -include("riak_kv_types.hrl").
+-include("riak_kv_ts.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -1033,7 +1034,7 @@ handle_coverage_index(Bucket, ItemFilter, Query,
             {reply, {error, {indexes_not_supported, Mod}}, State}
     end.
 
-handle_range_scan(Bucket, ItemFilter, Query,
+handle_range_scan(Bucket, ItemFilter, Query1,
                   FilterVNodes, Sender,
                   State=#state{mod=Mod,
                                key_buf_size=DefaultBufSz,
@@ -1045,10 +1046,18 @@ handle_range_scan(Bucket, ItemFilter, Query,
         true ->
             %% Update stats...
             ok = riak_kv_stat:update(vnode_index_read),
-
+            %% convert whatever version of the SQL record we received to the one
+            %% we're currently using, it could have been downgraded for older
+            %% versioned nodes in the cluster..
+            Query2 = riak_kv_select:convert(riak_kv_select:current_version(), Query1),
+            ?SQL_SELECT{'WHERE'    = W,
+                        local_key  = #key_v1{ast = LKAST}} = Query2,
+            %% convert the select record into a proplist so that the hanoidb
+            %% backend does not have a dependency on the TS header files
+            Query3 = [{where, W}, {local_key_ast, LKAST}],
             ResultFun = ResultFunFun(Bucket, Sender),
-            BufSize = buffer_size_for_index_query(Query, DefaultBufSz),
-            Opts = [{index, Bucket, prepare_index_query(Query)},
+            BufSize = buffer_size_for_index_query(Query2, DefaultBufSz),
+            Opts = [{index, Bucket, prepare_index_query(Query3)},
                     {bucket, Bucket}, {buffer_size, BufSize}],
             %% @HACK
             %% Really this should be decided in the backend
