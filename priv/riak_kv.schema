@@ -29,7 +29,7 @@
 %% and secondary indexes (if supported).
 {mapping, "storage_backend", "riak_kv.storage_backend", [
   {default, {{storage_backend}} },
-  {datatype, {enum, [bitcask, leveldb, memory, multi, prefix_multi]}}
+  {datatype, {enum, [hanoidb, bitcask, leveldb, memory, multi, prefix_multi]}}
 ]}.
 
 {translation,
@@ -42,7 +42,7 @@
       memory -> riak_kv_memory_backend;
       multi -> riak_kv_multi_backend;
       prefix_multi -> riak_kv_multi_prefix_backend;
-      _Default -> riak_kv_eleveldb_backend
+      hanoidb -> riak_kv_hanoidb_backend
     end
  end}.
 
