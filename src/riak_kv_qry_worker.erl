@@ -203,9 +203,9 @@ decode_results([{_,V}|Tail]) when is_binary(V) ->
         <<>> ->
             %% record was deleted
             decode_results(Tail);
-        FullRecord ->
-            Values = [CellValue || {_, CellValue} <- FullRecord],
-            [Values | decode_results(Tail)]
+        Values ->
+            %% FIXME should not have to convert to list
+            [tuple_to_list(Values) | decode_results(Tail)]
     end.
 
 %% Send a message to this process to get the next query.

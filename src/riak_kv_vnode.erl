@@ -1050,11 +1050,35 @@ handle_range_scan(Bucket, ItemFilter, Query1,
             %% we're currently using, it could have been downgraded for older
             %% versioned nodes in the cluster..
             Query2 = riak_kv_select:convert(riak_kv_select:current_version(), Query1),
-            ?SQL_SELECT{'WHERE'    = W,
-                        local_key  = #key_v1{ast = LKAST}} = Query2,
+            ?SQL_SELECT{'FROM' = BucketType,
+                        'WHERE' = W,
+                        local_key = #key_v1{ast = LKAST}} = Query2,
+            %% always rebuild the module name, do not use the name from the select
+            %% record because it was built in a different node which may have a
+            %% different module name because of compile versions in mixed version
+            %% clusters
+            HelperMod = riak_ql_ddl:make_module_name(BucketType),
+            PredicateFn =
+                case proplists:get_value(filter,W,[]) of
+                    [] ->
+                        fun(_) -> true end;
+                    Filter ->
+                        CompiledFn = riak_kv_qry_compiler:compile_filter(HelperMod, Filter),
+                        fun(Obj1) ->
+                            Obj2 = riak_object:from_binary(<<>>, <<>>, Obj1),
+                            case riak_object:get_value(Obj2)of
+                                << >> ->
+                                    false;
+                                Row ->
+                                    CompiledFn(Row)
+                            end
+                        end
+                end,
             %% convert the select record into a proplist so that the hanoidb
             %% backend does not have a dependency on the TS header files
-            Query3 = [{where, W}, {local_key_ast, LKAST}],
+            Query3 = [{where, W},
+                      {local_key_ast, LKAST},
+                      {filter_predicate_fn, PredicateFn}],
             ResultFun = ResultFunFun(Bucket, Sender),
             BufSize = buffer_size_for_index_query(Query2, DefaultBufSz),
             Opts = [{index, Bucket, prepare_index_query(Query3)},

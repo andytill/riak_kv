@@ -340,12 +340,10 @@ add_preflists(PartitionedData, NVal, UpNodes) ->
               PartitionedData).
 
 build_object(Bucket, Mod, DDL, Row, PK) ->
-    Obj = Mod:add_column_info(Row),
     LK  = riak_kv_ts_util:encode_typeval_key(
             riak_ql_ddl:get_local_key(DDL, Row, Mod)),
-
     RObj = riak_object:newts(
-             Bucket, PK, Obj,
+             Bucket, PK, Row,
              dict:from_list([{?MD_DDL_VERSION, ?DDL_VERSION}])),
     {LK, RObj}.
 

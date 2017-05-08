@@ -23,6 +23,7 @@
 -module(riak_kv_qry_compiler).
 
 -export([compile/2]).
+-export([compile_filter/2]).
 -export([finalise_aggregate/2]).
 -export([run_select/2, run_select/3]).
 
@@ -62,6 +63,32 @@
 %% Note that when such a query begins to be actually executed, the
 %% chunks will need to be really small, for the result to be within
 %% max query size.
+
+
+compile_filter(Mod, {'=',{field,FieldName,_},{const,Val}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) == Val end;
+compile_filter(Mod, {'!=',{field,FieldName,_},{const,Val}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) /= Val end;
+compile_filter(Mod, {'>',{field,FieldName,_},{const,Val}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) > Val end;
+compile_filter(Mod, {'>=',{field,FieldName,_},{const,Val}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) >= Val end;
+compile_filter(Mod, {'<',{field,FieldName,_},{const,Val}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) < Val end;
+compile_filter(Mod, {'<=',{field,FieldName,_},{const,Val}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) =< Val end;
+compile_filter(Mod, {is_null,{idenifier,FieldName}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) == [] end;
+compile_filter(Mod, {is_not_null,{idenifier,FieldName}}) ->
+    fun (Row) -> Mod:extract(Row, [FieldName]) /= [] end;
+compile_filter(Mod, {and_,A,B}) ->
+    Compiled_A = compile_filter(Mod, A),
+    Compiled_B = compile_filter(Mod, B),
+    fun(Row) -> Compiled_A(Row) andalso Compiled_B(Row) end;
+compile_filter(Mod, {or_,A,B}) ->
+    Compiled_A = compile_filter(Mod, A),
+    Compiled_B = compile_filter(Mod, B),
+    fun(Row) -> Compiled_A(Row) orelse Compiled_B(Row) end.
 
 compile(DDL, Query) ->
     compile(DDL, Query, options()).
