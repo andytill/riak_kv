@@ -45,6 +45,7 @@
           col_return_types = []   :: [riak_ql_ddl:external_field_type()],
           col_names        = []   :: [binary()],
           clause           = []   :: [riak_kv_qry_compiler:compiled_select()],
+          compiled_clause  = [],
           finalisers       = []   :: [skip | function()]
         }).
 

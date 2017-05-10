@@ -24,7 +24,9 @@
 
 -export([compile/2]).
 -export([compile_filter/2]).
+-export([compile_select_clause_fns/3]).
 -export([finalise_aggregate/2]).
+-export([options/0]).
 -export([run_select/2, run_select/3]).
 
 -ifdef(TEST).
@@ -289,7 +291,7 @@ run_select(Select, Row) ->
     %% there is no long running state
     run_select2(Select, Row, undefined, []).
 
-run_select(Select,  Row, InitialState) ->
+run_select(Select, Row, InitialState) ->
     %% the second argument is the state, if we're return row query results then
     %% there is no long running state
     run_select2(Select, Row, InitialState, []).
@@ -322,16 +324,7 @@ my_mapfoldl(F, Accu, []) when is_function(F, 2) -> {[],Accu}.
 
 %%
 compile_select_clause(DDL, Options, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{clause = Sel}} = Q) ->
-    %% compile each select column and put all the calc types into a set, if
-    %% any of the results are aggregate then aggregate is the calc type for the
-    %% whole query
-    CompileColFn =
-        fun(ColX, AccX) ->
-            select_column_clause_folder(DDL, Options, ColX, AccX)
-        end,
-    Acc = {sets:new(), #riak_sel_clause_v1{ }},
-    %% iterate from the right so we can append to the head of lists
-    {ResultTypeSet, Sel1} = lists:foldl(CompileColFn, Acc, Sel),
+    {ResultTypeSet, Sel1} = compile_select_clause_fns(DDL, Q, Options),
     {ColTypes, Errors} = my_mapfoldl(
         fun(ColASTX, Errors) ->
             infer_col_type(DDL, ColASTX, Errors)
@@ -357,6 +350,20 @@ compile_select_clause(DDL, Options, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{c
         [_|_] ->
             {error, {invalid_query, riak_kv_qry:format_query_syntax_errors(lists:reverse(Errors))}}
     end.
+
+%% Compiles the select clause to a list of erlang funs.
+%% Returns {ResultType, SelectFns}
+compile_select_clause_fns(DDL, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{clause = Sel}}, Options) ->
+    %% compile each select column and put all the calc types into a set, if
+    %% any of the results are aggregate then aggregate is the calc type for the
+    %% whole query
+    CompileColFn =
+        fun(ColX, AccX) ->
+            select_column_clause_folder(DDL, Options, ColX, AccX)
+        end,
+    Acc = {sets:new(), #riak_sel_clause_v1{clause = Sel}},
+    %% iterate from the right so we can append to the head of lists
+    lists:foldl(CompileColFn, Acc, Sel).
 
 %%
 -spec get_col_names(?DDL{}, ?SQL_SELECT{}) -> [binary()].
@@ -419,7 +426,7 @@ select_column_clause_folder(DDL, Options, ColAST1,
 select_column_clause_exploded_folder(DDL, Options, {ColAst, Finaliser}, {TypeSet1, SelClause1}) ->
     #riak_sel_clause_v1{
        initial_state = InitX,
-       clause = RunFnX,
+       compiled_clause = RunFnX,
        finalisers = Finalisers1 } = SelClause1,
     S = compile_select_col(DDL, Options, ColAst),
     TypeSet2 = sets:add_element(S#single_sel_column.calc_type, TypeSet1),
@@ -428,9 +435,9 @@ select_column_clause_exploded_folder(DDL, Options, {ColAst, Finaliser}, {TypeSet
     Finalisers2 = Finalisers1 ++ [Finaliser],
     %% ColTypes are messy because <<"*">> represents many
     %% so you need to flatten the list
-    SelClause2 = #riak_sel_clause_v1{
+    SelClause2 = SelClause1#riak_sel_clause_v1{
                     initial_state    = Init2,
-                    clause           = RunFn2,
+                    compiled_clause  = RunFn2,
                     finalisers       = lists:flatten(Finalisers2)},
     {TypeSet2, SelClause2}.
 
