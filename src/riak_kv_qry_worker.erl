@@ -336,20 +336,22 @@ estimate_query_size(#state{total_query_data  = TotalQueryData,
 
 
 %%
-add_subquery_result(SubQId, Chunk, #state{sub_qrys = SubQs,
+add_subquery_result(SubQId, {selected, Chunk}, #state{sub_qrys = SubQs,
                                           total_query_data = TotalQueryData,
                                           total_query_rows = TotalQueryRows,
                                           n_subqueries_done = NSubqueriesDone,
-                                          n_running_fsms = NRunning} = State) ->
+                                          n_running_fsms = NRunning,
+                                          qry = Query,
+                                          result = Result} = State) ->
     case lists:member(SubQId, SubQs) of
         true ->
             try
-                QueryResult = run_select_on_chunk(SubQId, Chunk, State),
+                QueryResult = riak_kv_select:run_merge_on_chunk(SubQId, Chunk, Query, Result),
                 NSubQ = lists:delete(SubQId, SubQs),
                 ThisChunkData = erlang:external_size(Chunk),
                 State#state{result            = QueryResult,
                             total_query_data  = TotalQueryData + ThisChunkData,
-                            total_query_rows  = TotalQueryRows + rows_in_chunk(Chunk),
+                            total_query_rows  = TotalQueryRows + length(Chunk),
                             n_subqueries_done = NSubqueriesDone + 1,
                             n_running_fsms    = NRunning - 1,
                             sub_qrys          = NSubQ}
@@ -364,118 +366,6 @@ add_subquery_result(SubQId, Chunk, #state{sub_qrys = SubQs,
             State
     end.
 
-%%
-run_select_on_chunk(SubQId, {selected, Chunk}, #state{qry = Query,
-                                                      result = QueryResult1,
-                                                      qbuf_ref = _QBufRef}) ->
-    %% Return decoded_results for this chunk.  We delegate this to a
-    %% helper function that determines whether the results have
-    %% already been decoded by the sending vnode
-
-    % DecodedChunk = get_decoded_results(Chunk),
-
-    % SelClause = sql_select_clause(Query),
-    case sql_select_calc_type(Query) of
-        rows ->
-            [{SubQId, Chunk} | QueryResult1]
-            % run_select_on_rows_chunk(SubQId, SelClause, DecodedChunk, QueryResult1, QBufRef);
-        % aggregate ->
-        %     %% query buffers don't enter at this stage: QueryResult is always a
-        %     %% single row for aggregate SELECTs
-        %     run_select_on_aggregate_chunk(SelClause, DecodedChunk, QueryResult1);
-        % group_by ->
-        %     %% ditto
-        %     run_select_on_group(Query, SelClause, DecodedChunk, QueryResult1)
-    end.
-
-%% ------------------------------------------------------------
-%% Helper function to return decoded query results for the current
-%% Chunk:
-%%
-%%   if already decoded, simply returns the decoded data
-%%
-%%   if not, decodes and returns
-%% ------------------------------------------------------------
-
-% get_decoded_results({decoded, Chunk}) ->
-%     Chunk;
-% get_decoded_results(Chunk) ->
-%     decode_results(lists:flatten(Chunk)).
-
-rows_in_chunk({_, Chunk}) ->
-    length(Chunk);
-rows_in_chunk(Chunk) ->
-    length(Chunk).
-
-
-%%
-% run_select_on_group(Query, SelClause, Chunk, QueryResult1) ->
-%     lists:foldl(
-%         fun(Row, Acc) ->
-%             run_select_on_group_row(Query, SelClause, Row, Acc)
-%         end, QueryResult1, Chunk).
-
-% %%
-% run_select_on_group_row(Query, SelClause, Row, QueryResult1) ->
-%     {group_by, InitialGroupState, Dict1} = QueryResult1,
-%     Key = select_group(Query, Row),
-%     Aggregate1 =
-%         case dict:find(Key, Dict1) of
-%             error ->
-%                 prepare_group_by_initial_state(Row, InitialGroupState);
-%             {ok, AggregateX} ->
-%                 AggregateX
-%         end,
-%     Aggregate2 = riak_kv_qry_compiler:run_select(SelClause, Row, Aggregate1),
-%     Dict2 = dict:store(Key, Aggregate2, Dict1),
-%     {group_by, InitialGroupState, Dict2}.
-
-% prepare_group_by_initial_state(Row, InitialState) ->
-%     [prepare_group_by_initial_state2(Row, Col) || Col <- InitialState].
-
-% prepare_group_by_initial_state2(Row, InitFn) when is_function(InitFn) ->
-%     InitFn(Row);
-% prepare_group_by_initial_state2(_, InitVal) ->
-%     InitVal.
-
-% %%
-% select_group(Query, Row) ->
-%     GroupByFields = sql_select_group_by(Query),
-%     select_group2(GroupByFields, Row).
-
-% select_group2([], _) ->
-%     [];
-% select_group2([{N,_}|Tail], Row) when is_integer(N) ->
-%     [lists:nth(N, Row)|select_group2(Tail, Row)];
-% select_group2([{GroupByTimeFn,_}|Tail], Row) when is_function(GroupByTimeFn) ->
-%     [GroupByTimeFn(Row)|select_group2(Tail, Row)].
-
-% %% Run the selection clause on results that accumulate rows
-% run_select_on_rows_chunk(SubQId, SelClause, DecodedChunk, QueryResult1, undefined) ->
-%     IndexedChunks =
-%         [riak_kv_qry_compiler:run_select(SelClause, Row) || Row <- DecodedChunk],
-%     [{SubQId, IndexedChunks} | QueryResult1];
-% run_select_on_rows_chunk(_SubQId, SelClause, DecodedChunk, _QueryResult1, QBufRef) ->
-%     IndexedChunks =
-%         [riak_kv_qry_compiler:run_select(SelClause, Row) || Row <- DecodedChunk],
-%     try riak_kv_qry_buffers:batch_put(QBufRef, IndexedChunks) of
-%         ok ->
-%             ok;
-%         {error, Reason} ->
-%             throw({qbuf_internal_error, Reason})
-%     catch
-%         Error:Reason ->
-%             lager:warning("Failed to send data to qbuf ~p serving subquery ~p of ~p: ~p:~p",
-%                           [QBufRef, _SubQId, SelClause, Error, Reason]),
-%             throw({qbuf_internal_error, "qbuf manager died/restarted mid-query"})
-%     end.
-
-% %%
-% run_select_on_aggregate_chunk(SelClause, DecodedChunk, QueryResult1) ->
-%     lists:foldl(
-%         fun(E, Acc) ->
-%             riak_kv_qry_compiler:run_select(SelClause, E, Acc)
-%         end, QueryResult1, DecodedChunk).
 
 %%
 -spec cancel_error_query(Error::any(), State1::#state{}) ->

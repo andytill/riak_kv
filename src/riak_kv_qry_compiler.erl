@@ -387,7 +387,8 @@ get_col_names2(_, Name) ->
           col_return_types :: [riak_pb_ts_codec:ldbvalue()],
           col_name         :: riak_pb_ts_codec:tscolumnname(),
           clause           :: function(),
-          finaliser        :: [function()]
+          finaliser        :: [function()],
+          merge_fn         :: function()
          }).
 
 %%
@@ -422,23 +423,27 @@ select_column_clause_folder(DDL, Options, ColAST1,
 
 %% When the select column is "exploded" it means that multiple functions that
 %% collect state have been extracted and given their own temporary columns
-%% which will be merged by the finalisers.
+%% which will be merged by the finalisers e.g. COUNT(*)+COUNT(*) ends up as one
+%% column to the user, but requires a temporary column for the second count
 select_column_clause_exploded_folder(DDL, Options, {ColAst, Finaliser}, {TypeSet1, SelClause1}) ->
     #riak_sel_clause_v1{
        initial_state = InitX,
        compiled_clause = RunFnX,
-       finalisers = Finalisers1 } = SelClause1,
+       finalisers = Finalisers1,
+       result_merger_fns = MergerFns1} = SelClause1,
     S = compile_select_col(DDL, Options, ColAst),
     TypeSet2 = sets:add_element(S#single_sel_column.calc_type, TypeSet1),
     Init2   = InitX ++ [S#single_sel_column.initial_state],
     RunFn2  = RunFnX ++ [S#single_sel_column.clause],
     Finalisers2 = Finalisers1 ++ [Finaliser],
+    MergerFns2 = MergerFns1 ++ [S#single_sel_column.merge_fn],
     %% ColTypes are messy because <<"*">> represents many
     %% so you need to flatten the list
     SelClause2 = SelClause1#riak_sel_clause_v1{
                     initial_state    = Init2,
                     compiled_clause  = RunFn2,
-                    finalisers       = lists:flatten(Finalisers2)},
+                    finalisers       = lists:flatten(Finalisers2),
+                    result_merger_fns = lists:flatten(MergerFns2)},
     {TypeSet2, SelClause2}.
 
 %% Compile a single selection column into a fun that can extract the cell
@@ -446,13 +451,18 @@ select_column_clause_exploded_folder(DDL, Options, {ColAst, Finaliser}, {TypeSet
 -spec compile_select_col(DDL::?DDL{}, options(), ColumnSpec::any()) ->
                                 #single_sel_column{}.
 compile_select_col(DDL, Options, {{window_agg_fn, FnName}, [FnArg1]}) when is_atom(FnName) ->
+    MergeFn =
+        fun(A, B) ->
+            riak_ql_window_agg_fns:merge(FnName, A, B)
+        end,
     case riak_ql_window_agg_fns:start_state(FnName) of
         stateless ->
             %% TODO this does not run the function! nothing is stateless so far though
             Fn = compile_select_col_stateless(DDL, Options, FnArg1),
-            #single_sel_column{ calc_type        = rows,
-                                initial_state    = undefined,
-                                clause           = Fn };
+            #single_sel_column{ calc_type = rows,
+                                initial_state = undefined,
+                                clause = Fn,
+                                merge_fn = MergeFn};
         Initial_state ->
             Compiled_arg1 = compile_select_col_stateless(DDL, Options, FnArg1),
             % all the windows agg fns so far are arity of 1
@@ -464,12 +474,16 @@ compile_select_col(DDL, Options, {{window_agg_fn, FnName}, [FnArg1]}) when is_at
                 end,
             #single_sel_column{ calc_type        = aggregate,
                                 initial_state    = Initial_state,
-                                clause           = SelectFn }
+                                clause           = SelectFn,
+                                merge_fn = MergeFn}
     end;
 compile_select_col(DDL, Options, Select) ->
+    %% in the case of a stateless column then A and B should be the same, so
+    %% just return A
     #single_sel_column{ calc_type = rows,
                         initial_state = undefined,
-                        clause = compile_select_col_stateless(DDL, Options, Select) }.
+                        clause = compile_select_col_stateless(DDL, Options, Select),
+                        merge_fn = fun(A,_) -> A end}.
 
 
 %% Returns a one arity fun which is stateless for example pulling a field from a
