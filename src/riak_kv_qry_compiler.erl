@@ -211,16 +211,17 @@ compile_where_clause(?DDL{} = DDL,
                      Options) ->
     try
         {W2,_} = resolve_expressions(Mod, Options, W1),
-        {W3,OrFilters} = hoist_partition_key_equality_filters([<<"a">>], W2),
+        {W3,OrFilters} = hoist_partition_key_equality_filters(Mod:partition_key_field_names(), W2),
         %% Now that the equality filters under OR for parition key fileds has been
         %% filtered out, we put a dummy value in there, so that the rest of the type
         %% checking passes
         %?debugFmt(">>> WHERE ~w ORFILTERS ~w",[Where2,OrFilters]),
         W4 = lists:foldl(
             fun({FieldName,_},Acc) ->
+                Value = temp_column_value(Mod:get_field_type([FieldName])),
                 case Acc of
-                    [] -> {'=',FieldName,{sint64,80085}};
-                    _  -> {and_,{'=',FieldName,{sint64,80085}},Acc}
+                    [] -> {'=',FieldName,Value};
+                    _  -> {and_,{'=',FieldName,Value},Acc}
                 end
             end, W3, OrFilters),
         case {check_if_timeseries(DDL, lists:flatten([W4])), unwrap_cover(Cover)} of
@@ -235,6 +236,12 @@ compile_where_clause(?DDL{} = DDL,
     catch
         throw:Error when element(1,Error) == error -> Error
     end.
+
+temp_column_value(boolean)  -> {boolean, false};
+temp_column_value(float)  -> {float, 0.30303030303};
+temp_column_value(sint64)  -> {sint64, 30303030303};
+temp_column_value(timestamp)  -> {timestamp, 30303030303};
+temp_column_value(varchar) -> {varchar, <<"X-TEMP">>}.
 
 %% now break out the query on quantum boundaries
 -spec expand_query(?DDL{}, list(), ?SQL_SELECT{}, proplists:proplist()) ->
@@ -1233,8 +1240,7 @@ hoist_partition_key_equality_filters(PartitionKeyNames, WhereAST) ->
     riak_ql_ddl:mapfold_where_tree(
         fun (_, Op, Acc_x) when Op == and_; Op == or_ ->
                 {ok, Acc_x};
-            (or_ = Root, {'=',A,_} = Filter, Acc_x) ->
-                ?debugFmt("ZZZ ROOT ~w FILTER ~w",[Root,Filter]),
+            (or_, {'=',A,_} = Filter, Acc_x) ->
                 case lists:member(A, PartitionKeyNames) of
                     true  ->
                         KeyFilters = proplists:get_value(A,Acc_x,[]),
@@ -1242,8 +1248,7 @@ hoist_partition_key_equality_filters(PartitionKeyNames, WhereAST) ->
                         {eliminate,Acc_x2};
                     false -> {Filter, Acc_x}
                 end;
-            (Root, Filter, Acc_x) ->
-                ?debugFmt("ROOT ~w FILTER ~w",[Root,Filter]),
+            (_, Filter, Acc_x) ->
                 {Filter, Acc_x}
         end, [], WhereAST).
 
@@ -2257,7 +2262,7 @@ lower_bound_is_same_as_upper_bound_test() ->
 
 query_has_no_AND_operator_1_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where time < 5"),
     ?assertEqual(
        {error, {incomplete_where_clause, ?E_TSMSG_NO_LOWER_BOUND}},
        compile(DDL, Q)
@@ -2265,7 +2270,7 @@ query_has_no_AND_operator_1_test() ->
 
 query_has_no_AND_operator_2_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time > 1 OR time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where time > 1 OR time < 5"),
     ?assertEqual(
        {error, {time_bounds_must_use_and_op, ?E_TIME_BOUNDS_MUST_USE_AND}},
        compile(DDL, Q)
@@ -2273,7 +2278,7 @@ query_has_no_AND_operator_2_test() ->
 
 query_has_no_AND_operator_3_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where user = 'user_1' AND time > 1 OR time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where user = 'user_1' AND time > 1 OR time < 5"),
     ?assertEqual(
        {error, {time_bounds_must_use_and_op, ?E_TIME_BOUNDS_MUST_USE_AND}},
        compile(DDL, Q)
@@ -2281,7 +2286,7 @@ query_has_no_AND_operator_3_test() ->
 
 query_has_no_AND_operator_4_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where user = 'user_1' OR time > 1 OR time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where user = 'user_1' OR time > 1 OR time < 5"),
     ?assertEqual(
        {error, {time_bounds_must_use_and_op, ?E_TIME_BOUNDS_MUST_USE_AND}},
        compile(DDL, Q)
@@ -2289,7 +2294,7 @@ query_has_no_AND_operator_4_test() ->
 
 missing_key_field_in_where_clause_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time > 1 and time < 6 and user = '2'"),
+    {ok, Q} = get_query("select * from GeoCheckin where time > 1 and time < 6 and user = '2'"),
     ?assertEqual(
        {error, {missing_key_clause, ?E_KEY_FIELD_NOT_IN_WHERE_CLAUSE("location")}},
        compile(DDL, Q)
@@ -2297,7 +2302,7 @@ missing_key_field_in_where_clause_test() ->
 
 not_equals_can_only_be_a_filter_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time > 1"
+    {ok, Q} = get_query("select * from GeoCheckin where time > 1"
                         " and time < 6 and user = '2' and location != '4'"),
     ?assertEqual(
        {error, {missing_key_clause, ?E_KEY_PARAM_MUST_USE_EQUALS_OPERATOR("location", '!=')}},
@@ -2306,7 +2311,7 @@ not_equals_can_only_be_a_filter_test() ->
 
 no_where_clause_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1"),
+    {ok, Q} = get_query("select * from GeoCheckin"),
     ?assertEqual(
        {error, {no_where_clause, ?E_NO_WHERE_CLAUSE}},
        compile(DDL, Q)
@@ -4663,6 +4668,15 @@ select_with_arithmetic_on_unknown_column_throws_an_error_test() ->
         is_query_valid(DDL, Q)
     ).
 
+hoist_partition_key_equality_filters_test() ->
+    {ok, ?SQL_SELECT{'WHERE' = Where}} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE b = 20 AND (a = 1 OR a = 2);"),
+    ?assertEqual(
+        {{'=',<<"b">>,{integer,20}}, [{<<"a">>,[{'=',<<"a">>,{integer,2}},{'=',<<"a">>,{integer,1}}]}]},
+        hoist_partition_key_equality_filters([<<"a">>,<<"b">>], Where)
+    ).
+
 select_multi_values_in_partition_key_test() ->
     DDL = get_ddl(
         "CREATE table table1 ("
@@ -4685,13 +4699,25 @@ select_multi_values_in_partition_key_test() ->
         lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
     ).
 
-hoist_partition_key_equality_filters_test() ->
-    {ok, ?SQL_SELECT{'WHERE' = Where}} = get_query(
+select_multi_values_in_partition_key_with_quantum_test() ->
+    DDL = get_ddl(
+        "CREATE table table1 ("
+        "a SINT64 NOT NULL,"
+        "b TIMESTAMP NOT NULL,"
+        "PRIMARY KEY ((a, QUANTUM(b,1,'m')), a,b));"
+    ),
+    {ok, Q} = get_query(
         "SELECT * FROM table1 "
-        "WHERE b = 20 AND (a = 1 OR a = 2);"),
+        "WHERE (a = 1 OR a = 2) AND b > 10 AND b < 20;"),
+    {ok, SubQueries} = compile(DDL, Q),
     ?assertEqual(
-        {{'=',<<"b">>,{integer,20}}, [{<<"a">>,[{'=',<<"a">>,{integer,2}},{'=',<<"a">>,{integer,1}}]}]},
-        hoist_partition_key_equality_filters([<<"a">>,<<"b">>], Where)
+        [[{startkey,[{<<"a">>,sint64,1},{<<"b">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,1},{<<"b">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,2},{<<"b">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,2},{<<"b">>,timestamp,20}]},
+          {filter, []}]],
+        lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
     ).
 
 -endif.
