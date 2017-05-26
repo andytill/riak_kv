@@ -145,6 +145,7 @@ compile_order_by({ok, ?SQL_SELECT{'ORDER BY' = OrderBy} = Q}) ->
 non_unique_identifiers(FF) ->
     Occurrences = [{F, occurs(F, FF)} || {F, _, _} <- FF],
     [F || {F, N} <- Occurrences, N > 1].
+
 occurs(F, FF) ->
     lists:foldl(
       fun({A, _, _}, N) when A == F -> N + 1;
@@ -210,23 +211,35 @@ compile_where_clause(?DDL{} = DDL,
                      Options) ->
     try
         {W2,_} = resolve_expressions(Mod, Options, W1),
-        case {check_if_timeseries(DDL, lists:flatten([W2])), unwrap_cover(Cover)} of
+        {W3,OrFilters} = hoist_partition_key_equality_filters([<<"a">>], W2),
+        %% Now that the equality filters under OR for parition key fileds has been
+        %% filtered out, we put a dummy value in there, so that the rest of the type
+        %% checking passes
+        %?debugFmt(">>> WHERE ~w ORFILTERS ~w",[Where2,OrFilters]),
+        W4 = lists:foldl(
+            fun({FieldName,_},Acc) ->
+                case Acc of
+                    [] -> {'=',FieldName,{sint64,80085}};
+                    _  -> {and_,{'=',FieldName,{sint64,80085}},Acc}
+                end
+            end, W3, OrFilters),
+        case {check_if_timeseries(DDL, lists:flatten([W4])), unwrap_cover(Cover)} of
             {{error, E}, _} ->
                 {error, E};
             {_, {error, E}} ->
                 {error, E};
-            {{true, W3}, {ok, {RealCover, WhereModifications}}} ->
-                expand_query(DDL, Q?SQL_SELECT{cover_context = RealCover},
-                             update_where_for_cover(W3, WhereModifications))
+            {{true, W5}, {ok, {RealCover, WhereModifications}}} ->
+                expand_query(DDL, OrFilters, Q?SQL_SELECT{cover_context = RealCover},
+                             update_where_for_cover(W5, WhereModifications))
         end
     catch
         throw:Error when element(1,Error) == error -> Error
     end.
 
 %% now break out the query on quantum boundaries
--spec expand_query(?DDL{}, ?SQL_SELECT{}, proplists:proplist()) ->
+-spec expand_query(?DDL{}, list(), ?SQL_SELECT{}, proplists:proplist()) ->
                           {ok, [?SQL_SELECT{}]} | {error, term()}.
-expand_query(?DDL{local_key = LK, partition_key = PK},
+expand_query(?DDL{local_key = LK, partition_key = PK}, OrFilters,
              ?SQL_SELECT{helper_mod = Mod} = Q1, Where1) ->
     case expand_where(Where1, PK) of
         {error, E} ->
@@ -240,15 +253,28 @@ expand_query(?DDL{local_key = LK, partition_key = PK},
                        'WHERE'       = maybe_fix_start_order(IsDescending, X),
                        local_key     = LK,
                        partition_key = PK} || X <- Where2],
-            SubQueries2 =
+            SubQueries2 = expand_sub_queries(OrFilters, SubQueries1),
+            SubQueries3 =
                 case IsDescending of
                     true ->
-                        fix_subquery_order(SubQueries1);
+                        fix_subquery_order(SubQueries2);
                     false ->
-                        SubQueries1
+                        SubQueries2
                 end,
-            {ok, SubQueries2}
+            {ok, SubQueries3}
     end.
+
+expand_sub_queries([], SubQueries) ->
+    SubQueries;
+expand_sub_queries(OrFilters, SubQueries) ->
+    [modify_sub_query_where_range_keys(F,Q) || Q <- SubQueries, {_, Filters} <- OrFilters, F <- Filters].
+
+modify_sub_query_where_range_keys({'=',FieldName,{_,Value}},?SQL_SELECT{'WHERE' = Where1} = Q) ->
+    SKey1 = modify_where_key(proplists:get_value(startkey, Where1), FieldName, Value),
+    EKey1 = modify_where_key(proplists:get_value(endkey, Where1), FieldName, Value),
+    Where2 = lists:keystore(startkey,1,Where1,{startkey,SKey1}),
+    Where3 = lists:keystore(endkey,1,Where2,  {endkey,EKey1}),
+    Q?SQL_SELECT{'WHERE' = Where3}.
 
 %% Only check the last column in the partition key, otherwise the start/end key
 %% does not need to be flipped. The data is not stored in a different order to
@@ -1200,6 +1226,26 @@ update_where_for_cover(Props, Field, {{StartVal, StartInclusive},
 modify_where_key(TupleList, Field, NewVal) ->
     {Field, FieldType, _OldVal} = lists:keyfind(Field, 1, TupleList),
     lists:keyreplace(Field, 1, TupleList, {Field, FieldType, NewVal}).
+
+%% pull out equality filters on the parititon key, these need to be made into multiple
+%% sub queries rather than a filter
+hoist_partition_key_equality_filters(PartitionKeyNames, WhereAST) ->
+    riak_ql_ddl:mapfold_where_tree(
+        fun (_, Op, Acc_x) when Op == and_; Op == or_ ->
+                {ok, Acc_x};
+            (or_ = Root, {'=',A,_} = Filter, Acc_x) ->
+                ?debugFmt("ZZZ ROOT ~w FILTER ~w",[Root,Filter]),
+                case lists:member(A, PartitionKeyNames) of
+                    true  ->
+                        KeyFilters = proplists:get_value(A,Acc_x,[]),
+                        Acc_x2 = lists:keystore(A,1,Acc_x,{A,[Filter|KeyFilters]}),
+                        {eliminate,Acc_x2};
+                    false -> {Filter, Acc_x}
+                end;
+            (Root, Filter, Acc_x) ->
+                ?debugFmt("ROOT ~w FILTER ~w",[Root,Filter]),
+                {Filter, Acc_x}
+        end, [], WhereAST).
 
 resolve_expressions(Mod, Options, WhereAST) ->
     Acc = acc, %% not used
@@ -4615,6 +4661,37 @@ select_with_arithmetic_on_unknown_column_throws_an_error_test() ->
     ?assertEqual(
         {false,[{unexpected_where_field,<<"x">>}]},
         is_query_valid(DDL, Q)
+    ).
+
+select_multi_values_in_partition_key_test() ->
+    DDL = get_ddl(
+        "CREATE table table1 ("
+        "a SINT64 NOT NULL,"
+        "PRIMARY KEY ((a), a));"
+    ),
+    {ok, Q} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE (a = 1 OR a = 2);"),
+    {ok, SubQueries} = compile(DDL, Q),
+    ?assertEqual(
+        [[{startkey,[{<<"a">>,sint64,1}]},
+          {endkey,  [{<<"a">>,sint64,1}]},
+          {filter, []},
+          {end_inclusive, true}],
+         [{startkey,[{<<"a">>,sint64,2}]},
+          {endkey,  [{<<"a">>,sint64,2}]},
+          {filter, []},
+          {end_inclusive, true}]],
+        lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
+    ).
+
+hoist_partition_key_equality_filters_test() ->
+    {ok, ?SQL_SELECT{'WHERE' = Where}} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE b = 20 AND (a = 1 OR a = 2);"),
+    ?assertEqual(
+        {{'=',<<"b">>,{integer,20}}, [{<<"a">>,[{'=',<<"a">>,{integer,2}},{'=',<<"a">>,{integer,1}}]}]},
+        hoist_partition_key_equality_filters([<<"a">>,<<"b">>], Where)
     ).
 
 -endif.
