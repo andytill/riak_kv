@@ -215,7 +215,7 @@ compile_where_clause(?DDL{} = DDL,
         %% Now that the equality filters under OR for parition key fileds has been
         %% filtered out, we put a dummy value in there, so that the rest of the type
         %% checking passes
-        %?debugFmt(">>> WHERE ~w ORFILTERS ~w",[Where2,OrFilters]),
+        % ?debugFmt(">>> WHERE ~w ORFILTERS ~w",[Where2,OrFilters]),
         W4 = lists:foldl(
             fun({FieldName,_},Acc) ->
                 Value = temp_column_value(Mod:get_field_type([FieldName])),
@@ -237,10 +237,10 @@ compile_where_clause(?DDL{} = DDL,
         throw:Error when element(1,Error) == error -> Error
     end.
 
-temp_column_value(boolean)  -> {boolean, false};
-temp_column_value(float)  -> {float, 0.30303030303};
-temp_column_value(sint64)  -> {sint64, 30303030303};
-temp_column_value(timestamp)  -> {timestamp, 30303030303};
+temp_column_value(boolean) -> {boolean, false};
+temp_column_value(float) -> {float, 0.30303030303};
+temp_column_value(sint64) -> {sint64, 30303030303};
+temp_column_value(timestamp) -> {timestamp, 30303030303};
 temp_column_value(varchar) -> {varchar, <<"X-TEMP">>}.
 
 %% now break out the query on quantum boundaries
@@ -253,35 +253,56 @@ expand_query(?DDL{local_key = LK, partition_key = PK}, OrFilters,
             {error, E};
         {ok, Where2} ->
             IsDescending = is_last_partition_column_descending(Mod:field_orders(), PK),
+            Where3 = expand_sub_queries(OrFilters, Where2),
             SubQueries1 =
                 [Q1?SQL_SELECT{
                        is_executable = true,
                        type          = timeseries,
                        'WHERE'       = maybe_fix_start_order(IsDescending, X),
                        local_key     = LK,
-                       partition_key = PK} || X <- Where2],
-            SubQueries2 = expand_sub_queries(OrFilters, SubQueries1),
-            SubQueries3 =
+                       partition_key = PK} || X <- Where3],
+            SubQueries2 =
                 case IsDescending of
                     true ->
-                        fix_subquery_order(SubQueries2);
+                        fix_subquery_order(SubQueries1);
                     false ->
-                        SubQueries2
+                        SubQueries1
                 end,
-            {ok, SubQueries3}
+            {ok, SubQueries2}
     end.
 
 expand_sub_queries([], SubQueries) ->
     SubQueries;
-expand_sub_queries(OrFilters, SubQueries) ->
-    [modify_sub_query_where_range_keys(F,Q) || Q <- SubQueries, {_, Filters} <- OrFilters, F <- Filters].
+expand_sub_queries(OrFilters1, SubQueries) ->
+    Keys = key_permuations([F || {_,F} <- OrFilters1]),
+    % ?debugFmt("OR FILTERS ~p",[OrFilters1]),
+    [modify_sub_query_where_range_keys(K,Q) || K <- Keys, Q <- SubQueries].
 
-modify_sub_query_where_range_keys({'=',FieldName,{_,Value}},?SQL_SELECT{'WHERE' = Where1} = Q) ->
-    SKey1 = modify_where_key(proplists:get_value(startkey, Where1), FieldName, Value),
-    EKey1 = modify_where_key(proplists:get_value(endkey, Where1), FieldName, Value),
-    Where2 = lists:keystore(startkey,1,Where1,{startkey,SKey1}),
-    Where3 = lists:keystore(endkey,1,Where2,  {endkey,EKey1}),
-    Q?SQL_SELECT{'WHERE' = Where3}.
+key_permuations([]) ->
+    [];
+key_permuations([H|T]) ->
+    [lists:reverse(Y) || Y <- key_permuations2([[X] || X <- H], T)].
+
+key_permuations2(Acc, []) ->
+    Acc;
+key_permuations2(Acc1, [H|Tail]) ->
+    Acc2 = [[B|A] || A <- Acc1, B <- H],
+    key_permuations2(Acc2, Tail).
+
+
+modify_sub_query_where_range_keys(Keys,WhereX) ->
+    lists:foldl(
+        fun({'=',FieldName,{_,Value}},Where1) ->
+            % ?debugFmt("EQ ~p = ~p",[FieldName,Value]),
+            SKey1 = modify_where_key(proplists:get_value(startkey, Where1), FieldName, Value),
+            EKey1 = modify_where_key(proplists:get_value(endkey, Where1), FieldName, Value),
+            % ?debugFmt("SKey1 ~p",[SKey1]),
+            Where2 = lists:keystore(startkey,1,Where1,{startkey,SKey1}),
+            Where3 = lists:keystore(endkey, 1, Where2,  {endkey,EKey1}),
+            % ?debugFmt("WHERE ~p",[Where3]),
+            Where3
+        end, WhereX, Keys).
+
 
 %% Only check the last column in the partition key, otherwise the start/end key
 %% does not need to be flipped. The data is not stored in a different order to
@@ -4718,6 +4739,52 @@ select_multi_values_in_partition_key_with_quantum_test() ->
           {endkey,  [{<<"a">>,sint64,2},{<<"b">>,timestamp,20}]},
           {filter, []}]],
         lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
+    ).
+
+select_multi_values_on_two_fields_in_partition_key_test() ->
+    DDL = get_ddl(
+        "CREATE table table1 ("
+        "a SINT64 NOT NULL,"
+        "b VARCHAR NOT NULL,"
+        "c TIMESTAMP NOT NULL,"
+        "PRIMARY KEY ((a, b, QUANTUM(c,1,'m')), a,b,c));"
+    ),
+    {ok, Q} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE (a = 1 OR a = 2) AND b IN ('g','j') AND c > 10 AND c < 20;"),
+    {ok, SubQueries} = compile(DDL, Q),
+    ?assertEqual(
+        [[{startkey,[{<<"a">>,sint64,1},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,1},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,1},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,1},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,2},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,2},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,2},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,2},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,20}]},
+          {filter, []}]],
+        lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
+    ).
+
+key_permuations_test() ->
+    ?assertEqual(
+        [[a,x],[a,y],[b,x],[b,y]],
+        key_permuations([[a,b],[x,y]])
+    ).
+
+key_permuations_longer_lists_test() ->
+    ?assertEqual(
+        [[a,d,x],[a,d,y],[a,e,x],[a,e,y],[b,d,x],[b,d,y],[b,e,x],[b,e,y]],
+        key_permuations([[a,b],[d,e],[x,y]])
+    ).
+
+key_permuations_lists_different_size_test() ->
+    ?assertEqual(
+        [[a,d,x],[a,d,y],[a,e,x],[a,e,y],[a,f,x],[a,f,y],[b,d,x],[b,d,y],[b,e,x],[b,e,y],[b,f,x],[b,f,y]],
+        key_permuations([[a,b],[d,e,f],[x,y]])
     ).
 
 -endif.
