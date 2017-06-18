@@ -128,7 +128,7 @@ handle_info({{SubQId, QId}, {error, Reason} = Error},
                    qid    = QId,
                    result = IndexedChunks}) ->
     lager:warning("Error ~p while collecting on QId ~p (~p);"
-                  " dropping ~b chunks of data accumulated so far",
+                  " dropping ~p chunks of data accumulated so far",
                   [Reason, QId, SubQId, IndexedChunks]),
     ReceiverPid ! Error,
     pop_next_query(),
@@ -351,7 +351,7 @@ add_subquery_result(SubQId, {selected, Chunk}, #state{sub_qrys = SubQs,
                 ThisChunkData = erlang:external_size(Chunk),
                 State#state{result            = QueryResult,
                             total_query_data  = TotalQueryData + ThisChunkData,
-                            total_query_rows  = TotalQueryRows + length(Chunk),
+                            total_query_rows  = TotalQueryRows + chunk_length(Chunk),
                             n_subqueries_done = NSubqueriesDone + 1,
                             n_running_fsms    = NRunning - 1,
                             sub_qrys          = NSubQ}
@@ -366,6 +366,9 @@ add_subquery_result(SubQId, {selected, Chunk}, #state{sub_qrys = SubQs,
             State
     end.
 
+%% FIXME major hack, need to get rid of the estimation stuff
+chunk_length([_|_] = Chunk) -> length(Chunk);
+chunk_length({group_by,_,Dict}) -> dict:size(Dict).
 
 %%
 -spec cancel_error_query(Error::any(), State1::#state{}) ->

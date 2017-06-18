@@ -318,13 +318,21 @@ run_merge_on_chunk(SubQId, Chunk, Query, Acc) ->
         aggregate ->
             run_merge_on_aggregate(sql_select_merge_fns(Query), Chunk, Acc);
         group_by ->
-            todo
+            run_merge_on_group_by(sql_select_merge_fns(Query), Chunk, Acc)
     end.
 
 run_merge_on_aggregate([], [], []) ->
     [];
 run_merge_on_aggregate([MergeFn|MergeTail], [Col|ColTail], [AccCol|Acc]) ->
     [MergeFn(Col,AccCol)|run_merge_on_aggregate(MergeTail,ColTail,Acc)].
+
+run_merge_on_group_by(AggMergeFns, {group_by, _, ChunkDict}, {group_by, InitialState, AccDict1}) ->
+    AccDict2 = dict:merge(
+        fun(_K, V1, V2) ->
+            run_merge_on_aggregate(AggMergeFns, V1, V2)
+        end,
+        ChunkDict, AccDict1),
+    {group_by, InitialState, AccDict2}.
 
 sql_select_calc_type(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = Type}}) ->
     Type.

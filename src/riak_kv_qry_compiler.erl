@@ -387,13 +387,15 @@ compile_select_clause(DDL, Options, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{c
     IsAggregate = sets:is_element(aggregate, ResultTypeSet),
     if
         IsGroupBy ->
-            Sel2 = Sel1#riak_sel_clause_v1{calc_type = group_by};
+            Sel2 = Sel1#riak_sel_clause_v1{
+                    calc_type = group_by,
+                    initial_state = {group_by, Sel1#riak_sel_clause_v1.initial_state, dict:new()}};
         IsAggregate ->
             Sel2 = Sel1#riak_sel_clause_v1{calc_type = aggregate};
         not IsAggregate ->
             Sel2 = Sel1#riak_sel_clause_v1{
-                   calc_type = rows,
-                   initial_state = []}
+                    calc_type = rows,
+                    initial_state = []}
     end,
     case Errors of
         [] ->
