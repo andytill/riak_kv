@@ -147,6 +147,7 @@ compile_order_by({ok, ?SQL_SELECT{'ORDER BY' = OrderBy} = Q}) ->
 non_unique_identifiers(FF) ->
     Occurrences = [{F, occurs(F, FF)} || {F, _, _} <- FF],
     [F || {F, N} <- Occurrences, N > 1].
+
 occurs(F, FF) ->
     lists:foldl(
       fun({A, _, _}, N) when A == F -> N + 1;
@@ -212,36 +213,56 @@ compile_where_clause(?DDL{} = DDL,
                      Options) ->
     try
         {W2,_} = resolve_expressions(Mod, Options, W1),
-        case {check_if_timeseries(DDL, lists:flatten([W2])), unwrap_cover(Cover)} of
+        {W3,OrFilters} = hoist_partition_key_equality_filters(Mod:partition_key_field_names(), W2),
+        %% Now that the equality filters under OR for parition key fileds has been
+        %% filtered out, we put a dummy value in there, so that the rest of the type
+        %% checking passes
+        % ?debugFmt(">>> WHERE ~w ORFILTERS ~w",[Where2,OrFilters]),
+        W4 = lists:foldl(
+            fun({FieldName,_},Acc) ->
+                Value = temp_column_value(Mod:get_field_type([FieldName])),
+                case Acc of
+                    [] -> {'=',FieldName,Value};
+                    _  -> {and_,{'=',FieldName,Value},Acc}
+                end
+            end, W3, OrFilters),
+        case {check_if_timeseries(DDL, lists:flatten([W4])), unwrap_cover(Cover)} of
             {{error, E}, _} ->
                 {error, E};
             {_, {error, E}} ->
                 {error, E};
-            {{true, W3}, {ok, {RealCover, WhereModifications}}} ->
-                expand_query(DDL, Q?SQL_SELECT{cover_context = RealCover},
-                             update_where_for_cover(W3, WhereModifications))
+            {{true, W5}, {ok, {RealCover, WhereModifications}}} ->
+                expand_query(DDL, OrFilters, Q?SQL_SELECT{cover_context = RealCover},
+                             update_where_for_cover(W5, WhereModifications))
         end
     catch
         throw:Error when element(1,Error) == error -> Error
     end.
 
+temp_column_value(boolean) -> {boolean, false};
+temp_column_value(float) -> {float, 0.30303030303};
+temp_column_value(sint64) -> {sint64, 30303030303};
+temp_column_value(timestamp) -> {timestamp, 30303030303};
+temp_column_value(varchar) -> {varchar, <<"X-TEMP">>}.
+
 %% now break out the query on quantum boundaries
--spec expand_query(?DDL{}, ?SQL_SELECT{}, proplists:proplist()) ->
+-spec expand_query(?DDL{}, list(), ?SQL_SELECT{}, proplists:proplist()) ->
                           {ok, [?SQL_SELECT{}]} | {error, term()}.
-expand_query(?DDL{local_key = LK, partition_key = PK},
+expand_query(?DDL{local_key = LK, partition_key = PK}, OrFilters,
              ?SQL_SELECT{helper_mod = Mod} = Q1, Where1) ->
     case expand_where(Where1, PK) of
         {error, E} ->
             {error, E};
         {ok, Where2} ->
             IsDescending = is_last_partition_column_descending(Mod:field_orders(), PK),
+            Where3 = expand_sub_queries(OrFilters, Where2),
             SubQueries1 =
                 [Q1?SQL_SELECT{
                        is_executable = true,
                        type          = timeseries,
                        'WHERE'       = maybe_fix_start_order(IsDescending, X),
                        local_key     = LK,
-                       partition_key = PK} || X <- Where2],
+                       partition_key = PK} || X <- Where3],
             SubQueries2 =
                 case IsDescending of
                     true ->
@@ -251,6 +272,39 @@ expand_query(?DDL{local_key = LK, partition_key = PK},
                 end,
             {ok, SubQueries2}
     end.
+
+expand_sub_queries([], SubQueries) ->
+    SubQueries;
+expand_sub_queries(OrFilters1, SubQueries) ->
+    Keys = key_permuations([F || {_,F} <- OrFilters1]),
+    % ?debugFmt("OR FILTERS ~p",[OrFilters1]),
+    [modify_sub_query_where_range_keys(K,Q) || K <- Keys, Q <- SubQueries].
+
+key_permuations([]) ->
+    [];
+key_permuations([H|T]) ->
+    [lists:reverse(Y) || Y <- key_permuations2([[X] || X <- H], T)].
+
+key_permuations2(Acc, []) ->
+    Acc;
+key_permuations2(Acc1, [H|Tail]) ->
+    Acc2 = [[B|A] || A <- Acc1, B <- H],
+    key_permuations2(Acc2, Tail).
+
+
+modify_sub_query_where_range_keys(Keys,WhereX) ->
+    lists:foldl(
+        fun({'=',FieldName,{_,Value}},Where1) ->
+            % ?debugFmt("EQ ~p = ~p",[FieldName,Value]),
+            SKey1 = modify_where_key(proplists:get_value(startkey, Where1), FieldName, Value),
+            EKey1 = modify_where_key(proplists:get_value(endkey, Where1), FieldName, Value),
+            % ?debugFmt("SKey1 ~p",[SKey1]),
+            Where2 = lists:keystore(startkey,1,Where1,{startkey,SKey1}),
+            Where3 = lists:keystore(endkey, 1, Where2,  {endkey,EKey1}),
+            % ?debugFmt("WHERE ~p",[Where3]),
+            Where3
+        end, WhereX, Keys).
+
 
 %% Only check the last column in the partition key, otherwise the start/end key
 %% does not need to be flipped. The data is not stored in a different order to
@@ -1221,6 +1275,24 @@ update_where_for_cover(Props, Field, {{StartVal, StartInclusive},
 modify_where_key(TupleList, Field, NewVal) ->
     {Field, FieldType, _OldVal} = lists:keyfind(Field, 1, TupleList),
     lists:keyreplace(Field, 1, TupleList, {Field, FieldType, NewVal}).
+
+%% pull out equality filters on the parititon key, these need to be made into multiple
+%% sub queries rather than a filter
+hoist_partition_key_equality_filters(PartitionKeyNames, WhereAST) ->
+    riak_ql_ddl:mapfold_where_tree(
+        fun (_, Op, Acc_x) when Op == and_; Op == or_ ->
+                {ok, Acc_x};
+            (or_, {'=',A,_} = Filter, Acc_x) ->
+                case lists:member(A, PartitionKeyNames) of
+                    true  ->
+                        KeyFilters = proplists:get_value(A,Acc_x,[]),
+                        Acc_x2 = lists:keystore(A,1,Acc_x,{A,[Filter|KeyFilters]}),
+                        {eliminate,Acc_x2};
+                    false -> {Filter, Acc_x}
+                end;
+            (_, Filter, Acc_x) ->
+                {Filter, Acc_x}
+        end, [], WhereAST).
 
 resolve_expressions(Mod, Options, WhereAST) ->
     Acc = acc, %% not used
@@ -2232,7 +2304,7 @@ lower_bound_is_same_as_upper_bound_test() ->
 
 query_has_no_AND_operator_1_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where time < 5"),
     ?assertEqual(
        {error, {incomplete_where_clause, ?E_TSMSG_NO_LOWER_BOUND}},
        compile(DDL, Q)
@@ -2240,7 +2312,7 @@ query_has_no_AND_operator_1_test() ->
 
 query_has_no_AND_operator_2_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time > 1 OR time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where time > 1 OR time < 5"),
     ?assertEqual(
        {error, {time_bounds_must_use_and_op, ?E_TIME_BOUNDS_MUST_USE_AND}},
        compile(DDL, Q)
@@ -2248,7 +2320,7 @@ query_has_no_AND_operator_2_test() ->
 
 query_has_no_AND_operator_3_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where user = 'user_1' AND time > 1 OR time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where user = 'user_1' AND time > 1 OR time < 5"),
     ?assertEqual(
        {error, {time_bounds_must_use_and_op, ?E_TIME_BOUNDS_MUST_USE_AND}},
        compile(DDL, Q)
@@ -2256,7 +2328,7 @@ query_has_no_AND_operator_3_test() ->
 
 query_has_no_AND_operator_4_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where user = 'user_1' OR time > 1 OR time < 5"),
+    {ok, Q} = get_query("select * from GeoCheckin where user = 'user_1' OR time > 1 OR time < 5"),
     ?assertEqual(
        {error, {time_bounds_must_use_and_op, ?E_TIME_BOUNDS_MUST_USE_AND}},
        compile(DDL, Q)
@@ -2264,7 +2336,7 @@ query_has_no_AND_operator_4_test() ->
 
 missing_key_field_in_where_clause_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time > 1 and time < 6 and user = '2'"),
+    {ok, Q} = get_query("select * from GeoCheckin where time > 1 and time < 6 and user = '2'"),
     ?assertEqual(
        {error, {missing_key_clause, ?E_KEY_FIELD_NOT_IN_WHERE_CLAUSE("location")}},
        compile(DDL, Q)
@@ -2272,7 +2344,7 @@ missing_key_field_in_where_clause_test() ->
 
 not_equals_can_only_be_a_filter_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1 where time > 1"
+    {ok, Q} = get_query("select * from GeoCheckin where time > 1"
                         " and time < 6 and user = '2' and location != '4'"),
     ?assertEqual(
        {error, {missing_key_clause, ?E_KEY_PARAM_MUST_USE_EQUALS_OPERATOR("location", '!=')}},
@@ -2281,7 +2353,7 @@ not_equals_can_only_be_a_filter_test() ->
 
 no_where_clause_test() ->
     DDL = get_standard_ddl(),
-    {ok, Q} = get_query("select * from test1"),
+    {ok, Q} = get_query("select * from GeoCheckin"),
     ?assertEqual(
        {error, {no_where_clause, ?E_NO_WHERE_CLAUSE}},
        compile(DDL, Q)
@@ -4636,6 +4708,104 @@ select_with_arithmetic_on_unknown_column_throws_an_error_test() ->
     ?assertEqual(
         {false,[{unexpected_where_field,<<"x">>}]},
         is_query_valid(DDL, Q)
+    ).
+
+hoist_partition_key_equality_filters_test() ->
+    {ok, ?SQL_SELECT{'WHERE' = Where}} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE b = 20 AND (a = 1 OR a = 2);"),
+    ?assertEqual(
+        {{'=',<<"b">>,{integer,20}}, [{<<"a">>,[{'=',<<"a">>,{integer,2}},{'=',<<"a">>,{integer,1}}]}]},
+        hoist_partition_key_equality_filters([<<"a">>,<<"b">>], Where)
+    ).
+
+select_multi_values_in_partition_key_test() ->
+    DDL = get_ddl(
+        "CREATE table table1 ("
+        "a SINT64 NOT NULL,"
+        "PRIMARY KEY ((a), a));"
+    ),
+    {ok, Q} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE (a = 1 OR a = 2);"),
+    {ok, SubQueries} = compile(DDL, Q),
+    ?assertEqual(
+        [[{startkey,[{<<"a">>,sint64,1}]},
+          {endkey,  [{<<"a">>,sint64,1}]},
+          {filter, []},
+          {end_inclusive, true}],
+         [{startkey,[{<<"a">>,sint64,2}]},
+          {endkey,  [{<<"a">>,sint64,2}]},
+          {filter, []},
+          {end_inclusive, true}]],
+        lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
+    ).
+
+select_multi_values_in_partition_key_with_quantum_test() ->
+    DDL = get_ddl(
+        "CREATE table table1 ("
+        "a SINT64 NOT NULL,"
+        "b TIMESTAMP NOT NULL,"
+        "PRIMARY KEY ((a, QUANTUM(b,1,'m')), a,b));"
+    ),
+    {ok, Q} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE (a = 1 OR a = 2) AND b > 10 AND b < 20;"),
+    {ok, SubQueries} = compile(DDL, Q),
+    ?assertEqual(
+        [[{startkey,[{<<"a">>,sint64,1},{<<"b">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,1},{<<"b">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,2},{<<"b">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,2},{<<"b">>,timestamp,20}]},
+          {filter, []}]],
+        lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
+    ).
+
+select_multi_values_on_two_fields_in_partition_key_test() ->
+    DDL = get_ddl(
+        "CREATE table table1 ("
+        "a SINT64 NOT NULL,"
+        "b VARCHAR NOT NULL,"
+        "c TIMESTAMP NOT NULL,"
+        "PRIMARY KEY ((a, b, QUANTUM(c,1,'m')), a,b,c));"
+    ),
+    {ok, Q} = get_query(
+        "SELECT * FROM table1 "
+        "WHERE (a = 1 OR a = 2) AND b IN ('g','j') AND c > 10 AND c < 20;"),
+    {ok, SubQueries} = compile(DDL, Q),
+    ?assertEqual(
+        [[{startkey,[{<<"a">>,sint64,1},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,1},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,1},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,1},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,2},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,2},{<<"b">>,varchar,<<"g">>},{<<"c">>,timestamp,20}]},
+          {filter, []}],
+         [{startkey,[{<<"a">>,sint64,2},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,11}]},
+          {endkey,  [{<<"a">>,sint64,2},{<<"b">>,varchar,<<"j">>},{<<"c">>,timestamp,20}]},
+          {filter, []}]],
+        lists:sort([W || ?SQL_SELECT{'WHERE' = W} <- SubQueries])
+    ).
+
+key_permuations_test() ->
+    ?assertEqual(
+        [[a,x],[a,y],[b,x],[b,y]],
+        key_permuations([[a,b],[x,y]])
+    ).
+
+key_permuations_longer_lists_test() ->
+    ?assertEqual(
+        [[a,d,x],[a,d,y],[a,e,x],[a,e,y],[b,d,x],[b,d,y],[b,e,x],[b,e,y]],
+        key_permuations([[a,b],[d,e],[x,y]])
+    ).
+
+key_permuations_lists_different_size_test() ->
+    ?assertEqual(
+        [[a,d,x],[a,d,y],[a,e,x],[a,e,y],[a,f,x],[a,f,y],[b,d,x],[b,d,y],[b,e,x],[b,e,y],[b,f,x],[b,f,y]],
+        key_permuations([[a,b],[d,e,f],[x,y]])
     ).
 
 -endif.
