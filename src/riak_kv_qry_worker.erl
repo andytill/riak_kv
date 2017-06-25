@@ -403,10 +403,10 @@ subqueries_done(QId, #state{qid          = QId,
                                     [[riak_pb_ts_codec:ldbvalue()]]}.
 prepare_final_results(#state{qbuf_ref = undefined,
                              result = IndexedChunks,
-                             qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select}}) ->
+                             qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select} = Query}) ->
     %% sort by index, to reassemble according to coverage plan
     {_, R2} = lists:unzip(lists:sort(IndexedChunks)),
-    prepare_final_results2(Select, lists:append(R2));
+    prepare_final_results2(Select, maybe_offset(Query, lists:append(R2)));
 
 prepare_final_results(#state{qbuf_ref = QBufRef,
                              qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select,
@@ -471,12 +471,19 @@ prepare_final_results2(#riak_sel_clause_v1{col_return_types = ColTypes,
 sql_select_calc_type(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = Type}}) ->
     Type.
 
-% %% Return the selection clause from a query
-% sql_select_clause(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{compiled_clause = Clause}}) ->
-%     Clause.
+maybe_offset(?SQL_SELECT{'OFFSET' = []}, Rows) ->
+    Rows;
+maybe_offset(?SQL_SELECT{'OFFSET' = [Offset]}, Rows) ->
+    safe_nthtail(Offset, Rows).
 
-% sql_select_group_by(?SQL_SELECT{ group_by = GroupBy }) ->
-%     GroupBy.
+%% safe because this function will not throw an exception if the list is not
+%% longer than the offset, unlike lists:nthtail/2
+safe_nthtail(0, Rows) ->
+    Rows;
+safe_nthtail(_, []) ->
+    [];
+safe_nthtail(Offset, [_|Tail]) ->
+    safe_nthtail(Offset-1, Tail).
 
 %%%===================================================================
 %%% Unit tests
