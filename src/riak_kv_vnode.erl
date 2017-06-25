@@ -1052,6 +1052,10 @@ handle_range_scan(Bucket, ItemFilter, Query1,
             ?SQL_SELECT{'SELECT' = Select,
                         'FROM' = BucketType,
                         'WHERE' = W,
+                        'OFFSET' = Offset,
+                        'LIMIT' = Limit,
+                        group_by = GroupBy,
+                        'ORDER BY' = OrderBy,
                         local_key = #key_v1{ast = LKAST}} = Query2,
             %% always rebuild the module name, do not use the name from the select
             %% record because it was built in a different node which may have a
@@ -1079,8 +1083,12 @@ handle_range_scan(Bucket, ItemFilter, Query1,
             %% convert the select record into a proplist so that the hanoidb
             %% backend does not have a dependency on the TS header files
             QueryProps = [{where, W},
-                      {local_key_ast, LKAST},
-                      {filter_predicate_fn, PredicateFn}],
+                          {offset, Offset},
+                          {limit, Limit},
+                          {group_by, GroupBy},
+                          {order_by, OrderBy},
+                          {local_key_ast, LKAST},
+                          {filter_predicate_fn, PredicateFn}],
             Query3 = Query2?SQL_SELECT{'SELECT' = Select#riak_sel_clause_v1{compiled_clause = SelClause}},
             ResultFun =
                 fun(Items) ->

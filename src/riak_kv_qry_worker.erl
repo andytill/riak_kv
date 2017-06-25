@@ -367,7 +367,7 @@ add_subquery_result(SubQId, {selected, Chunk}, #state{sub_qrys = SubQs,
     end.
 
 %% FIXME major hack, need to get rid of the estimation stuff
-chunk_length([_|_] = Chunk) -> length(Chunk);
+chunk_length(Chunk) when is_list(Chunk) -> length(Chunk);
 chunk_length({group_by,_,Dict}) -> dict:size(Dict).
 
 %%
