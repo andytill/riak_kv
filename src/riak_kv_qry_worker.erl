@@ -406,7 +406,7 @@ prepare_final_results(#state{qbuf_ref = undefined,
                              qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select} = Query}) ->
     %% sort by index, to reassemble according to coverage plan
     {_, R2} = lists:unzip(lists:sort(IndexedChunks)),
-    prepare_final_results2(Select, maybe_offset(Query, lists:append(R2)));
+    prepare_final_results2(Select, maybe_apply_offset_limit(Query, lists:append(R2)));
 
 prepare_final_results(#state{qbuf_ref = QBufRef,
                              qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select,
@@ -471,10 +471,16 @@ prepare_final_results2(#riak_sel_clause_v1{col_return_types = ColTypes,
 sql_select_calc_type(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = Type}}) ->
     Type.
 
-maybe_offset(?SQL_SELECT{'OFFSET' = []}, Rows) ->
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [], 'LIMIT' = []}, Rows) ->
     Rows;
-maybe_offset(?SQL_SELECT{'OFFSET' = [Offset]}, Rows) ->
-    safe_nthtail(Offset, Rows).
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [Offset], 'LIMIT' = []}, Rows) when is_integer(Offset), Offset >= 0 ->
+    safe_nthtail(Offset, Rows);
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [], 'LIMIT' = [Limit]}, Rows) when is_integer(Limit), Limit >= 0 ->
+    lists:sublist(Rows, Limit);
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [Offset], 'LIMIT' = [Limit]}, Rows) when is_integer(Offset), is_integer(Limit), Offset >= 0, Limit >= 0 ->
+    lists:sublist(safe_nthtail(Offset, Rows), Limit);
+maybe_apply_offset_limit(_, _) ->
+    [].
 
 %% safe because this function will not throw an exception if the list is not
 %% longer than the offset, unlike lists:nthtail/2
