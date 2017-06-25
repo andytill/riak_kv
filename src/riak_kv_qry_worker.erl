@@ -116,12 +116,18 @@ handle_info(pop_next_query, State1) ->
     {noreply, State2};
 
 handle_info({{_, QId}, done}, #state{ qid = QId } = State) ->
-    {noreply, subqueries_done(QId, State)};
+    {noreply, maybe_subqueries_done(QId, State)};
 
-handle_info({{SubQId, QId}, {results, Chunk}}, #state{qid = QId} = State) ->
-    {noreply, throttling_spawn_index_fsms(
-                estimate_query_size(
-                  add_subquery_result(SubQId, Chunk, State)))};
+handle_info({{SubQId, QId}, {results, Chunk}}, #state{qid = QId} = State1) ->
+    State2 = add_subquery_result(SubQId, Chunk, State1),
+    %% we may be able to return early from a query if we have enough rows to
+    %% meet the OFFSET and LIMIT
+    case is_result_limit_satisfied(State2) of
+        true ->
+            {noreply, subqueries_done(State2)};
+        false ->
+            {noreply, throttling_spawn_index_fsms(estimate_query_size(State2))}
+    end;
 
 handle_info({{SubQId, QId}, {error, Reason} = Error},
             #state{receiver_pid = ReceiverPid,
@@ -381,21 +387,23 @@ cancel_error_query(Error, #state{qbuf_ref = QBufRef,
     new_state().
 
 %%
-subqueries_done(QId, #state{qid          = QId,
-                            receiver_pid = ReceiverPid,
-                            sub_qrys     = SubQQ} = State) ->
+maybe_subqueries_done(QId, #state{qid = QId,
+                                  sub_qrys = SubQQ} = State) ->
     case SubQQ of
         [] ->
-            QueryResult2 = prepare_final_results(State),
-            %   send the results to the waiting client process
-            ReceiverPid ! {ok, QueryResult2},
-            pop_next_query(),
-            % clean the state of query specfic data, ready for the next one
-            new_state();
+            subqueries_done(State);
         _ ->
             % more sub queries are left to run
             State
     end.
+
+subqueries_done(#state{receiver_pid = ReceiverPid} = State) ->
+    QueryResult2 = prepare_final_results(State),
+    %   send the results to the waiting client process
+    ReceiverPid ! {ok, QueryResult2},
+    pop_next_query(),
+    % clean the state of query specfic data, ready for the next one
+    new_state().
 
 -spec prepare_final_results(#state{}) ->
                                    {[riak_pb_ts_codec:tscolumnname()],
@@ -490,6 +498,29 @@ safe_nthtail(_, []) ->
     [];
 safe_nthtail(Offset, [_|Tail]) ->
     safe_nthtail(Offset-1, Tail).
+
+%% returns true if the number of rows that have been received for the
+%% current query is greater than or equal to the OFFSET and LIMIT. If
+%% ORDER BY or GROUP BY has been specified then we need all sub query
+%% results and cannot return early.
+is_result_limit_satisfied(#state{total_query_rows = TotalRows, qry = Query}) ->
+    case find_query_limit(Query?SQL_SELECT.'OFFSET', Query?SQL_SELECT.'LIMIT',
+                          Query?SQL_SELECT.group_by, Query?SQL_SELECT.'ORDER BY') of
+        undefined ->
+            false;
+        RequiredRows ->
+            TotalRows >= RequiredRows
+    end.
+
+find_query_limit(Offset, Limit, GroupBy, OrderBy) when GroupBy /= [] orelse
+                                                       OrderBy /= [] orelse
+                                                       (Offset == [] andalso Limit == []) ->
+    undefined;
+find_query_limit(Offset, Limit, _, _) ->
+    limit_number(Offset) + limit_number(Limit).
+
+limit_number([ ]) -> 0;
+limit_number([V]) -> V.
 
 %%%===================================================================
 %%% Unit tests
