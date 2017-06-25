@@ -116,19 +116,25 @@ handle_info(pop_next_query, State1) ->
     {noreply, State2};
 
 handle_info({{_, QId}, done}, #state{ qid = QId } = State) ->
-    {noreply, subqueries_done(QId, State)};
+    {noreply, maybe_subqueries_done(QId, State)};
 
-handle_info({{SubQId, QId}, {results, Chunk}}, #state{qid = QId} = State) ->
-    {noreply, throttling_spawn_index_fsms(
-                estimate_query_size(
-                  add_subquery_result(SubQId, Chunk, State)))};
+handle_info({{SubQId, QId}, {results, Chunk}}, #state{qid = QId} = State1) ->
+    State2 = add_subquery_result(SubQId, Chunk, State1),
+    %% we may be able to return early from a query if we have enough rows to
+    %% meet the OFFSET and LIMIT
+    case is_result_limit_satisfied(State2) of
+        true ->
+            {noreply, subqueries_done(State2)};
+        false ->
+            {noreply, throttling_spawn_index_fsms(estimate_query_size(State2))}
+    end;
 
 handle_info({{SubQId, QId}, {error, Reason} = Error},
             #state{receiver_pid = ReceiverPid,
                    qid    = QId,
                    result = IndexedChunks}) ->
     lager:warning("Error ~p while collecting on QId ~p (~p);"
-                  " dropping ~b chunks of data accumulated so far",
+                  " dropping ~p chunks of data accumulated so far",
                   [Reason, QId, SubQId, IndexedChunks]),
     ReceiverPid ! Error,
     pop_next_query(),
@@ -336,20 +342,22 @@ estimate_query_size(#state{total_query_data  = TotalQueryData,
 
 
 %%
-add_subquery_result(SubQId, Chunk, #state{sub_qrys = SubQs,
+add_subquery_result(SubQId, {selected, Chunk}, #state{sub_qrys = SubQs,
                                           total_query_data = TotalQueryData,
                                           total_query_rows = TotalQueryRows,
                                           n_subqueries_done = NSubqueriesDone,
-                                          n_running_fsms = NRunning} = State) ->
+                                          n_running_fsms = NRunning,
+                                          qry = Query,
+                                          result = Result} = State) ->
     case lists:member(SubQId, SubQs) of
         true ->
             try
-                QueryResult = run_select_on_chunk(SubQId, Chunk, State),
+                QueryResult = riak_kv_select:run_merge_on_chunk(SubQId, Chunk, Query, Result),
                 NSubQ = lists:delete(SubQId, SubQs),
                 ThisChunkData = erlang:external_size(Chunk),
                 State#state{result            = QueryResult,
                             total_query_data  = TotalQueryData + ThisChunkData,
-                            total_query_rows  = TotalQueryRows + rows_in_chunk(Chunk),
+                            total_query_rows  = TotalQueryRows + chunk_length(Chunk),
                             n_subqueries_done = NSubqueriesDone + 1,
                             n_running_fsms    = NRunning - 1,
                             sub_qrys          = NSubQ}
@@ -364,118 +372,9 @@ add_subquery_result(SubQId, Chunk, #state{sub_qrys = SubQs,
             State
     end.
 
-%%
-run_select_on_chunk(SubQId, Chunk, #state{qry = Query,
-                                          result = QueryResult1,
-                                          qbuf_ref = QBufRef}) ->
-
-    %% Return decoded_results for this chunk.  We delegate this to a
-    %% helper function that determines whether the results have
-    %% already been decoded by the sending vnode
-
-    DecodedChunk = get_decoded_results(Chunk),
-
-    SelClause = sql_select_clause(Query),
-    case sql_select_calc_type(Query) of
-        rows ->
-            run_select_on_rows_chunk(SubQId, SelClause, DecodedChunk, QueryResult1, QBufRef);
-        aggregate ->
-            %% query buffers don't enter at this stage: QueryResult is always a
-            %% single row for aggregate SELECTs
-            run_select_on_aggregate_chunk(SelClause, DecodedChunk, QueryResult1);
-        group_by ->
-            %% ditto
-            run_select_on_group(Query, SelClause, DecodedChunk, QueryResult1)
-    end.
-
-%% ------------------------------------------------------------
-%% Helper function to return decoded query results for the current
-%% Chunk:
-%%
-%%   if already decoded, simply returns the decoded data
-%%
-%%   if not, decodes and returns
-%% ------------------------------------------------------------
-
-get_decoded_results({decoded, Chunk}) ->
-    Chunk;
-get_decoded_results(Chunk) ->
-    decode_results(lists:flatten(Chunk)).
-
-rows_in_chunk({decoded, Chunk}) ->
-    length(Chunk);
-rows_in_chunk(Chunk) ->
-    length(Chunk).
-
-
-%%
-run_select_on_group(Query, SelClause, Chunk, QueryResult1) ->
-    lists:foldl(
-        fun(Row, Acc) ->
-            run_select_on_group_row(Query, SelClause, Row, Acc)
-        end, QueryResult1, Chunk).
-
-%%
-run_select_on_group_row(Query, SelClause, Row, QueryResult1) ->
-    {group_by, InitialGroupState, Dict1} = QueryResult1,
-    Key = select_group(Query, Row),
-    Aggregate1 =
-        case dict:find(Key, Dict1) of
-            error ->
-                prepare_group_by_initial_state(Row, InitialGroupState);
-            {ok, AggregateX} ->
-                AggregateX
-        end,
-    Aggregate2 = riak_kv_qry_compiler:run_select(SelClause, Row, Aggregate1),
-    Dict2 = dict:store(Key, Aggregate2, Dict1),
-    {group_by, InitialGroupState, Dict2}.
-
-prepare_group_by_initial_state(Row, InitialState) ->
-    [prepare_group_by_initial_state2(Row, Col) || Col <- InitialState].
-
-prepare_group_by_initial_state2(Row, InitFn) when is_function(InitFn) ->
-    InitFn(Row);
-prepare_group_by_initial_state2(_, InitVal) ->
-    InitVal.
-
-%%
-select_group(Query, Row) ->
-    GroupByFields = sql_select_group_by(Query),
-    select_group2(GroupByFields, Row).
-
-select_group2([], _) ->
-    [];
-select_group2([{N,_}|Tail], Row) when is_integer(N) ->
-    [lists:nth(N, Row)|select_group2(Tail, Row)];
-select_group2([{GroupByTimeFn,_}|Tail], Row) when is_function(GroupByTimeFn) ->
-    [GroupByTimeFn(Row)|select_group2(Tail, Row)].
-
-%% Run the selection clause on results that accumulate rows
-run_select_on_rows_chunk(SubQId, SelClause, DecodedChunk, QueryResult1, undefined) ->
-    IndexedChunks =
-        [riak_kv_qry_compiler:run_select(SelClause, Row) || Row <- DecodedChunk],
-    [{SubQId, IndexedChunks} | QueryResult1];
-run_select_on_rows_chunk(_SubQId, SelClause, DecodedChunk, _QueryResult1, QBufRef) ->
-    IndexedChunks =
-        [riak_kv_qry_compiler:run_select(SelClause, Row) || Row <- DecodedChunk],
-    try riak_kv_qry_buffers:batch_put(QBufRef, IndexedChunks) of
-        ok ->
-            ok;
-        {error, Reason} ->
-            throw({qbuf_internal_error, Reason})
-    catch
-        Error:Reason ->
-            lager:warning("Failed to send data to qbuf ~p serving subquery ~p of ~p: ~p:~p",
-                          [QBufRef, _SubQId, SelClause, Error, Reason]),
-            throw({qbuf_internal_error, "qbuf manager died/restarted mid-query"})
-    end.
-
-%%
-run_select_on_aggregate_chunk(SelClause, DecodedChunk, QueryResult1) ->
-    lists:foldl(
-        fun(E, Acc) ->
-            riak_kv_qry_compiler:run_select(SelClause, E, Acc)
-        end, QueryResult1, DecodedChunk).
+%% FIXME major hack, need to get rid of the estimation stuff
+chunk_length(Chunk) when is_list(Chunk) -> length(Chunk);
+chunk_length({group_by,_,Dict}) -> dict:size(Dict).
 
 %%
 -spec cancel_error_query(Error::any(), State1::#state{}) ->
@@ -488,21 +387,23 @@ cancel_error_query(Error, #state{qbuf_ref = QBufRef,
     new_state().
 
 %%
-subqueries_done(QId, #state{qid          = QId,
-                            receiver_pid = ReceiverPid,
-                            sub_qrys     = SubQQ} = State) ->
+maybe_subqueries_done(QId, #state{qid = QId,
+                                  sub_qrys = SubQQ} = State) ->
     case SubQQ of
         [] ->
-            QueryResult2 = prepare_final_results(State),
-            %   send the results to the waiting client process
-            ReceiverPid ! {ok, QueryResult2},
-            pop_next_query(),
-            % clean the state of query specfic data, ready for the next one
-            new_state();
+            subqueries_done(State);
         _ ->
             % more sub queries are left to run
             State
     end.
+
+subqueries_done(#state{receiver_pid = ReceiverPid} = State) ->
+    QueryResult2 = prepare_final_results(State),
+    %   send the results to the waiting client process
+    ReceiverPid ! {ok, QueryResult2},
+    pop_next_query(),
+    % clean the state of query specfic data, ready for the next one
+    new_state().
 
 -spec prepare_final_results(#state{}) ->
                                    {[riak_pb_ts_codec:tscolumnname()],
@@ -510,10 +411,10 @@ subqueries_done(QId, #state{qid          = QId,
                                     [[riak_pb_ts_codec:ldbvalue()]]}.
 prepare_final_results(#state{qbuf_ref = undefined,
                              result = IndexedChunks,
-                             qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select}}) ->
+                             qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select} = Query}) ->
     %% sort by index, to reassemble according to coverage plan
     {_, R2} = lists:unzip(lists:sort(IndexedChunks)),
-    prepare_final_results2(Select, lists:append(R2));
+    prepare_final_results2(Select, maybe_apply_offset_limit(Query, lists:append(R2)));
 
 prepare_final_results(#state{qbuf_ref = QBufRef,
                              qry = ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = rows} = Select,
@@ -578,12 +479,48 @@ prepare_final_results2(#riak_sel_clause_v1{col_return_types = ColTypes,
 sql_select_calc_type(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = Type}}) ->
     Type.
 
-%% Return the selection clause from a query
-sql_select_clause(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{clause = Clause}}) ->
-    Clause.
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [], 'LIMIT' = []}, Rows) ->
+    Rows;
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [Offset], 'LIMIT' = []}, Rows) when is_integer(Offset), Offset >= 0 ->
+    safe_nthtail(Offset, Rows);
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [], 'LIMIT' = [Limit]}, Rows) when is_integer(Limit), Limit >= 0 ->
+    lists:sublist(Rows, Limit);
+maybe_apply_offset_limit(?SQL_SELECT{'OFFSET' = [Offset], 'LIMIT' = [Limit]}, Rows) when is_integer(Offset), is_integer(Limit), Offset >= 0, Limit >= 0 ->
+    lists:sublist(safe_nthtail(Offset, Rows), Limit);
+maybe_apply_offset_limit(_, _) ->
+    [].
 
-sql_select_group_by(?SQL_SELECT{ group_by = GroupBy }) ->
-    GroupBy.
+%% safe because this function will not throw an exception if the list is not
+%% longer than the offset, unlike lists:nthtail/2
+safe_nthtail(0, Rows) ->
+    Rows;
+safe_nthtail(_, []) ->
+    [];
+safe_nthtail(Offset, [_|Tail]) ->
+    safe_nthtail(Offset-1, Tail).
+
+%% returns true if the number of rows that have been received for the
+%% current query is greater than or equal to the OFFSET and LIMIT. If
+%% ORDER BY or GROUP BY has been specified then we need all sub query
+%% results and cannot return early.
+is_result_limit_satisfied(#state{total_query_rows = TotalRows, qry = Query}) ->
+    case find_query_limit(Query?SQL_SELECT.'OFFSET', Query?SQL_SELECT.'LIMIT',
+                          Query?SQL_SELECT.group_by, Query?SQL_SELECT.'ORDER BY') of
+        undefined ->
+            false;
+        RequiredRows ->
+            TotalRows >= RequiredRows
+    end.
+
+find_query_limit(Offset, Limit, GroupBy, OrderBy) when GroupBy /= [] orelse
+                                                       OrderBy /= [] orelse
+                                                       (Offset == [] andalso Limit == []) ->
+    undefined;
+find_query_limit(Offset, Limit, _, _) ->
+    limit_number(Offset) + limit_number(Limit).
+
+limit_number([ ]) -> 0;
+limit_number([V]) -> V.
 
 %%%===================================================================
 %%% Unit tests

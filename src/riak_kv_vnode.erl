@@ -981,7 +981,7 @@ handle_coverage_request(kv_sql_select_request,
     Bucket = riak_kv_requests:get_bucket(Req),
     Query = riak_kv_requests:get_query(Req),
     handle_range_scan(Bucket, ItemFilter, Query,
-                      FilterVNodes, Sender, State, fun range_scan_result_fun_ack/2);
+                      FilterVNodes, Sender, State);
 handle_coverage_request(kv_index_request, Req, FilterVNodes, Sender, State) ->
     Bucket = riak_kv_requests:get_bucket(Req),
     ItemFilter = riak_kv_requests:get_item_filter(Req),
@@ -1038,8 +1038,7 @@ handle_range_scan(Bucket, ItemFilter, Query1,
                   FilterVNodes, Sender,
                   State=#state{mod=Mod,
                                key_buf_size=DefaultBufSz,
-                               modstate=ModState},
-                  ResultFunFun) ->
+                               modstate=ModState}) ->
     {ok, Capabilities} = Mod:capabilities(Bucket, ModState),
     IndexBackend = lists:member(indexes, Capabilities),
     case IndexBackend of
@@ -1050,14 +1049,21 @@ handle_range_scan(Bucket, ItemFilter, Query1,
             %% we're currently using, it could have been downgraded for older
             %% versioned nodes in the cluster..
             Query2 = riak_kv_select:convert(riak_kv_select:current_version(), Query1),
-            ?SQL_SELECT{'FROM' = BucketType,
+            ?SQL_SELECT{'SELECT' = Select,
+                        'FROM' = BucketType,
                         'WHERE' = W,
+                        'OFFSET' = Offset,
+                        'LIMIT' = Limit,
+                        group_by = GroupBy,
+                        'ORDER BY' = OrderBy,
                         local_key = #key_v1{ast = LKAST}} = Query2,
             %% always rebuild the module name, do not use the name from the select
             %% record because it was built in a different node which may have a
             %% different module name because of compile versions in mixed version
             %% clusters
             HelperMod = riak_ql_ddl:make_module_name(BucketType),
+            {_, #riak_sel_clause_v1{compiled_clause = SelClause}} = riak_kv_qry_compiler:compile_select_clause_fns(
+                HelperMod:get_ddl(), Query2, riak_kv_qry_compiler:options()),
             PredicateFn =
                 case proplists:get_value(filter,W,[]) of
                     [] ->
@@ -1076,12 +1082,20 @@ handle_range_scan(Bucket, ItemFilter, Query1,
                 end,
             %% convert the select record into a proplist so that the hanoidb
             %% backend does not have a dependency on the TS header files
-            Query3 = [{where, W},
-                      {local_key_ast, LKAST},
-                      {filter_predicate_fn, PredicateFn}],
-            ResultFun = ResultFunFun(Bucket, Sender),
+            QueryProps = [{where, W},
+                          {offset, Offset},
+                          {limit, Limit},
+                          {group_by, GroupBy},
+                          {order_by, OrderBy},
+                          {local_key_ast, LKAST},
+                          {filter_predicate_fn, PredicateFn}],
+            Query3 = Query2?SQL_SELECT{'SELECT' = Select#riak_sel_clause_v1{compiled_clause = SelClause}},
+            ResultFun =
+                fun(Items) ->
+                    range_scan_result_fun_ack(Bucket, Sender, Query3, Items)
+                end,
             BufSize = buffer_size_for_index_query(Query2, DefaultBufSz),
-            Opts = [{index, Bucket, prepare_index_query(Query3)},
+            Opts = [{index, Bucket, prepare_index_query(QueryProps)},
                     {bucket, Bucket}, {buffer_size, BufSize}],
             %% @HACK
             %% Really this should be decided in the backend
@@ -2113,45 +2127,28 @@ result_fun_ack(Bucket, Sender) ->
 %% during debugging.
 %% ------------------------------------------------------------
 
-range_scan_result_fun_ack(Bucket, Sender) ->
-    fun(Items) ->
-	    range_scan_result_fun_ack(Bucket, Sender, Items)
-    end.
-
-range_scan_result_fun_ack(Bucket, Sender, Items) ->
+range_scan_result_fun_ack(Bucket, Sender, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{initial_state = InitialState}} = Query, Items) ->
     Monitor = riak_core_vnode:monitor(Sender),
-
-    %% Check capabilities.  If upgraded, decode the results
-    %% here.  If mixed, delegate decoding to the coordinator,
-    %% as before
-    
-    case riak_core_capability:get({riak_kv, decode_query_results_at_vnode}) of
-	true ->
-	    DecodedItems = riak_kv_qry_worker:decode_results(lists:flatten(Items)),
-	    
-	    %% Instead of simply sending DecodedItems as the
-	    %% payload, we send a tuple indicating that the
-	    %% items have already been decoded.  This allows
-	    %% the receiver to distinguish between results
-	    %% that have already been decoded by the vnode
-	    %% (new behavior indicated by {riak_kv,
-	    %% sql_select_decode_results} capability), and
-	    %% results that have not (TS behavior prior to
-	    %% this change)
-	    
-	    riak_core_vnode:reply(Sender, {{self(), Monitor}, Bucket, {decoded, DecodedItems}});
-	_ ->
-	    riak_core_vnode:reply(Sender, {{self(), Monitor}, Bucket, Items})
-    end,
-    
+    %% Instead of simply sending DecodedItems as the
+    %% payload, we send a tuple indicating that the
+    %% items have already been decoded.  This allows
+    %% the receiver to distinguish between results
+    %% that have already been decoded by the vnode
+    %% (new behavior indicated by {riak_kv,
+    %% sql_select_decode_results} capability), and
+    %% results that have not (TS behavior prior to
+    %% this change)
+    DecodedItems = riak_kv_qry_worker:decode_results(lists:flatten(Items)),
+    SelectedItems = riak_kv_select:run_select_on_chunk(DecodedItems, Query, InitialState),
+    riak_core_vnode:reply(Sender, {{self(), Monitor}, Bucket, {selected, SelectedItems}}),
     receive
-	{Monitor, ok} ->
-	    erlang:demonitor(Monitor, [flush]);
-	{Monitor, stop_fold} ->
-	    erlang:demonitor(Monitor, [flush]),
-	    throw(stop_fold);
-	{'DOWN', Monitor, process, _Pid, _Reason} ->
-	    throw(receiver_down)
+        {Monitor, ok} ->
+            erlang:demonitor(Monitor, [flush]);
+        {Monitor, stop_fold} ->
+            erlang:demonitor(Monitor, [flush]),
+            throw(stop_fold);
+        {'DOWN', Monitor, process, _Pid, _Reason} ->
+            throw(receiver_down)
     end.
 
 %% @doc If a listkeys request sends a result of `{From, Bucket,

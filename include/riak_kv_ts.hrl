@@ -40,13 +40,18 @@
 
 -record(riak_sel_clause_v1,
         {
-          calc_type        = rows :: select_result_type(),
-          initial_state    = []   :: [any()],
-          col_return_types = []   :: [riak_ql_ddl:external_field_type()],
-          col_names        = []   :: [binary()],
-          clause           = []   :: [riak_kv_qry_compiler:compiled_select()],
-          finalisers       = []   :: [skip | function()]
-        }).
+          calc_type = rows :: select_result_type(),
+          initial_state = [] :: [any()],
+          col_return_types = [] :: [riak_ql_ddl:external_field_type()],
+          col_names = [] :: [binary()],
+          %% the select clause AST
+          clause = []   :: [riak_kv_qry_compiler:compiled_select()],
+          %% the select clause AST compiled into funs, valid only on the node
+          %% that compiled the funs
+          compiled_clause = [],
+          finalisers = [] :: [skip | function()],
+          result_merger_fns = []
+        }). 
 
 -define(GROUP_BY_DEFAULT, []).
 -record(riak_select_v1,

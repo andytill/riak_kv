@@ -26,6 +26,8 @@
 -export([current_version/0]).
 -export([first_version/0]).
 -export([is_sql_select_record/1]).
+-export([run_merge_on_chunk/4]).
+-export([run_select_on_chunk/3]).
 
 -include("riak_kv_ts.hrl").
 
@@ -214,6 +216,136 @@ is_sql_select_record(#riak_select_v1{ }) -> true;
 is_sql_select_record(#riak_select_v2{ }) -> true;
 is_sql_select_record(#riak_select_v3{ }) -> true;
 is_sql_select_record(_)                  -> false.
+
+%%
+run_select_on_chunk(Chunk, ?SQL_SELECT{} =  Query, Acc) ->
+    case sql_select_calc_type(Query) of
+        rows ->
+            run_select_on_rows_chunk(sql_select_clause(Query), Chunk, undefined);
+        aggregate ->
+            run_select_on_aggregate_chunk(sql_select_clause(Query), Chunk, Acc);
+        group_by ->
+            run_select_on_group(Query, sql_select_clause(Query), Chunk, Acc)
+    end.
+
+%% ------------------------------------------------------------
+%% Helper function to return decoded query results for the current
+%% Chunk:
+%%
+%%   if already decoded, simply returns the decoded data
+%%
+%%   if not, decodes and returns
+%% ------------------------------------------------------------
+
+% rows_in_chunk({_, Chunk}) ->
+%     length(Chunk);
+% rows_in_chunk(Chunk) ->
+%     length(Chunk).
+
+
+%%
+run_select_on_group(Query, SelClause, Chunk, QueryResult1) ->
+    lists:foldl(
+        fun(Row, Acc) ->
+            run_select_on_group_row(Query, SelClause, Row, Acc)
+        end, QueryResult1, Chunk).
+
+%%
+run_select_on_group_row(Query, SelClause, Row, QueryResult1) ->
+    {group_by, InitialGroupState, Dict1} = QueryResult1,
+    Key = select_group(Query, Row),
+    Aggregate1 =
+        case dict:find(Key, Dict1) of
+            error ->
+                prepare_group_by_initial_state(Row, InitialGroupState);
+            {ok, AggregateX} ->
+                AggregateX
+        end,
+    Aggregate2 = riak_kv_qry_compiler:run_select(SelClause, Row, Aggregate1),
+    Dict2 = dict:store(Key, Aggregate2, Dict1),
+    {group_by, InitialGroupState, Dict2}.
+
+prepare_group_by_initial_state(Row, InitialState) ->
+    [prepare_group_by_initial_state2(Row, Col) || Col <- InitialState].
+
+prepare_group_by_initial_state2(Row, InitFn) when is_function(InitFn) ->
+    InitFn(Row);
+prepare_group_by_initial_state2(_, InitVal) ->
+    InitVal.
+
+%%
+select_group(Query, Row) ->
+    GroupByFields = sql_select_group_by(Query),
+    select_group2(GroupByFields, Row).
+
+select_group2([], _) ->
+    [];
+select_group2([{N,_}|Tail], Row) when is_integer(N) ->
+    [lists:nth(N, Row)|select_group2(Tail, Row)];
+select_group2([{GroupByTimeFn,_}|Tail], Row) when is_function(GroupByTimeFn) ->
+    [GroupByTimeFn(Row)|select_group2(Tail, Row)].
+
+%% Run the selection clause on results that accumulate rows
+run_select_on_rows_chunk(SelClause, DecodedChunk, undefined) ->
+    [riak_kv_qry_compiler:run_select(SelClause, Row) || Row <- DecodedChunk];
+run_select_on_rows_chunk(SelClause, DecodedChunk, QBufRef) ->
+    IndexedChunks =
+        [riak_kv_qry_compiler:run_select(SelClause, Row) || Row <- DecodedChunk],
+    try riak_kv_qry_buffers:batch_put(QBufRef, IndexedChunks) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            throw({qbuf_internal_error, Reason})
+    catch
+        Error:Reason ->
+            lager:warning("Failed to send data to qbuf ~p serving subquery ~p of ~p: ~p:~p",
+                          [QBufRef, x, SelClause, Error, Reason]),
+            throw({qbuf_internal_error, "qbuf manager died/restarted mid-query"})
+    end.
+
+%%
+run_select_on_aggregate_chunk(SelClause, DecodedChunk, QueryResult1) ->
+    lists:foldl(
+        fun(E, Acc) ->
+            riak_kv_qry_compiler:run_select(SelClause, E, Acc)
+        end, QueryResult1, DecodedChunk).
+
+%%
+run_merge_on_chunk(SubQId, Chunk, Query, Acc) ->
+    case sql_select_calc_type(Query) of
+        rows ->
+            [{SubQId,Chunk}|Acc];
+        aggregate ->
+            run_merge_on_aggregate(sql_select_merge_fns(Query), Chunk, Acc);
+        group_by ->
+            run_merge_on_group_by(sql_select_merge_fns(Query), Chunk, Acc)
+    end.
+
+run_merge_on_aggregate([], [], []) ->
+    [];
+run_merge_on_aggregate([MergeFn|MergeTail], [Col|ColTail], [AccCol|Acc]) ->
+    [MergeFn(Col,AccCol)|run_merge_on_aggregate(MergeTail,ColTail,Acc)].
+
+run_merge_on_group_by(AggMergeFns, {group_by, _, ChunkDict}, {group_by, InitialState, AccDict1}) ->
+    AccDict2 = dict:merge(
+        fun(_K, V1, V2) ->
+            run_merge_on_aggregate(AggMergeFns, V1, V2)
+        end,
+        ChunkDict, AccDict1),
+    {group_by, InitialState, AccDict2}.
+
+sql_select_calc_type(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{calc_type = Type}}) ->
+    Type.
+
+%% Return the selection clause from a query
+sql_select_clause(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{compiled_clause = Clause}}) ->
+    Clause.
+
+sql_select_group_by(?SQL_SELECT{group_by = GroupBy}) ->
+    GroupBy.
+
+sql_select_merge_fns(?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{result_merger_fns = MergeFns}}) ->
+    MergeFns.
 
 %%%
 %%% TESTS

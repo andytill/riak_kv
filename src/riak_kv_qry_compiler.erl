@@ -24,7 +24,9 @@
 
 -export([compile/2]).
 -export([compile_filter/2]).
+-export([compile_select_clause_fns/3]).
 -export([finalise_aggregate/2]).
+-export([options/0]).
 -export([run_select/2, run_select/3]).
 
 -ifdef(TEST).
@@ -343,7 +345,7 @@ run_select(Select, Row) ->
     %% there is no long running state
     run_select2(Select, Row, undefined, []).
 
-run_select(Select,  Row, InitialState) ->
+run_select(Select, Row, InitialState) ->
     %% the second argument is the state, if we're return row query results then
     %% there is no long running state
     run_select2(Select, Row, InitialState, []).
@@ -376,16 +378,7 @@ my_mapfoldl(F, Accu, []) when is_function(F, 2) -> {[],Accu}.
 
 %%
 compile_select_clause(DDL, Options, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{clause = Sel}} = Q) ->
-    %% compile each select column and put all the calc types into a set, if
-    %% any of the results are aggregate then aggregate is the calc type for the
-    %% whole query
-    CompileColFn =
-        fun(ColX, AccX) ->
-            select_column_clause_folder(DDL, Options, ColX, AccX)
-        end,
-    Acc = {sets:new(), #riak_sel_clause_v1{ }},
-    %% iterate from the right so we can append to the head of lists
-    {ResultTypeSet, Sel1} = lists:foldl(CompileColFn, Acc, Sel),
+    {ResultTypeSet, Sel1} = compile_select_clause_fns(DDL, Q, Options),
     {ColTypes, Errors} = my_mapfoldl(
         fun(ColASTX, Errors) ->
             infer_col_type(DDL, ColASTX, Errors)
@@ -394,13 +387,15 @@ compile_select_clause(DDL, Options, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{c
     IsAggregate = sets:is_element(aggregate, ResultTypeSet),
     if
         IsGroupBy ->
-            Sel2 = Sel1#riak_sel_clause_v1{calc_type = group_by};
+            Sel2 = Sel1#riak_sel_clause_v1{
+                    calc_type = group_by,
+                    initial_state = {group_by, Sel1#riak_sel_clause_v1.initial_state, dict:new()}};
         IsAggregate ->
             Sel2 = Sel1#riak_sel_clause_v1{calc_type = aggregate};
         not IsAggregate ->
             Sel2 = Sel1#riak_sel_clause_v1{
-                   calc_type = rows,
-                   initial_state = []}
+                    calc_type = rows,
+                    initial_state = []}
     end,
     case Errors of
         [] ->
@@ -411,6 +406,20 @@ compile_select_clause(DDL, Options, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{c
         [_|_] ->
             {error, {invalid_query, riak_kv_qry:format_query_syntax_errors(lists:reverse(Errors))}}
     end.
+
+%% Compiles the select clause to a list of erlang funs.
+%% Returns {ResultType, SelectFns}
+compile_select_clause_fns(DDL, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{clause = Sel}}, Options) ->
+    %% compile each select column and put all the calc types into a set, if
+    %% any of the results are aggregate then aggregate is the calc type for the
+    %% whole query
+    CompileColFn =
+        fun(ColX, AccX) ->
+            select_column_clause_folder(DDL, Options, ColX, AccX)
+        end,
+    Acc = {sets:new(), #riak_sel_clause_v1{clause = Sel}},
+    %% iterate from the right so we can append to the head of lists
+    lists:foldl(CompileColFn, Acc, Sel).
 
 %%
 -spec get_col_names(?DDL{}, ?SQL_SELECT{}) -> [binary()].
@@ -434,7 +443,8 @@ get_col_names2(_, Name) ->
           col_return_types :: [riak_pb_ts_codec:ldbvalue()],
           col_name         :: riak_pb_ts_codec:tscolumnname(),
           clause           :: function(),
-          finaliser        :: [function()]
+          finaliser        :: [function()],
+          merge_fn         :: function()
          }).
 
 %%
@@ -469,23 +479,27 @@ select_column_clause_folder(DDL, Options, ColAST1,
 
 %% When the select column is "exploded" it means that multiple functions that
 %% collect state have been extracted and given their own temporary columns
-%% which will be merged by the finalisers.
+%% which will be merged by the finalisers e.g. COUNT(*)+COUNT(*) ends up as one
+%% column to the user, but requires a temporary column for the second count
 select_column_clause_exploded_folder(DDL, Options, {ColAst, Finaliser}, {TypeSet1, SelClause1}) ->
     #riak_sel_clause_v1{
        initial_state = InitX,
-       clause = RunFnX,
-       finalisers = Finalisers1 } = SelClause1,
+       compiled_clause = RunFnX,
+       finalisers = Finalisers1,
+       result_merger_fns = MergerFns1} = SelClause1,
     S = compile_select_col(DDL, Options, ColAst),
     TypeSet2 = sets:add_element(S#single_sel_column.calc_type, TypeSet1),
     Init2   = InitX ++ [S#single_sel_column.initial_state],
     RunFn2  = RunFnX ++ [S#single_sel_column.clause],
     Finalisers2 = Finalisers1 ++ [Finaliser],
+    MergerFns2 = MergerFns1 ++ [S#single_sel_column.merge_fn],
     %% ColTypes are messy because <<"*">> represents many
     %% so you need to flatten the list
-    SelClause2 = #riak_sel_clause_v1{
+    SelClause2 = SelClause1#riak_sel_clause_v1{
                     initial_state    = Init2,
-                    clause           = RunFn2,
-                    finalisers       = lists:flatten(Finalisers2)},
+                    compiled_clause  = RunFn2,
+                    finalisers       = lists:flatten(Finalisers2),
+                    result_merger_fns = lists:flatten(MergerFns2)},
     {TypeSet2, SelClause2}.
 
 %% Compile a single selection column into a fun that can extract the cell
@@ -493,13 +507,18 @@ select_column_clause_exploded_folder(DDL, Options, {ColAst, Finaliser}, {TypeSet
 -spec compile_select_col(DDL::?DDL{}, options(), ColumnSpec::any()) ->
                                 #single_sel_column{}.
 compile_select_col(DDL, Options, {{window_agg_fn, FnName}, [FnArg1]}) when is_atom(FnName) ->
+    MergeFn =
+        fun(A, B) ->
+            riak_ql_window_agg_fns:merge(FnName, A, B)
+        end,
     case riak_ql_window_agg_fns:start_state(FnName) of
         stateless ->
             %% TODO this does not run the function! nothing is stateless so far though
             Fn = compile_select_col_stateless(DDL, Options, FnArg1),
-            #single_sel_column{ calc_type        = rows,
-                                initial_state    = undefined,
-                                clause           = Fn };
+            #single_sel_column{ calc_type = rows,
+                                initial_state = undefined,
+                                clause = Fn,
+                                merge_fn = MergeFn};
         Initial_state ->
             Compiled_arg1 = compile_select_col_stateless(DDL, Options, FnArg1),
             % all the windows agg fns so far are arity of 1
@@ -511,12 +530,16 @@ compile_select_col(DDL, Options, {{window_agg_fn, FnName}, [FnArg1]}) when is_at
                 end,
             #single_sel_column{ calc_type        = aggregate,
                                 initial_state    = Initial_state,
-                                clause           = SelectFn }
+                                clause           = SelectFn,
+                                merge_fn = MergeFn}
     end;
 compile_select_col(DDL, Options, Select) ->
+    %% in the case of a stateless column then A and B should be the same, so
+    %% just return A
     #single_sel_column{ calc_type = rows,
                         initial_state = undefined,
-                        clause = compile_select_col_stateless(DDL, Options, Select) }.
+                        clause = compile_select_col_stateless(DDL, Options, Select),
+                        merge_fn = fun(A,_) -> A end}.
 
 
 %% Returns a one arity fun which is stateless for example pulling a field from a
