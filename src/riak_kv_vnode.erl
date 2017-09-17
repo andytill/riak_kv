@@ -874,11 +874,12 @@ handle_request(kv_w1c_put_request, Req, _Sender, State=#state{async_put=false}) 
     {Bucket, Key} = riak_kv_requests:get_bucket_key(Req),
     EncodedVal = riak_kv_requests:get_encoded_obj(Req),
     ReplicaType = riak_kv_requests:get_replica_type(Req),
+    Expiry = riak_kv_requests:get_expiry(Req),
     Mod = State#state.mod,
     ModState = State#state.modstate,
     Idx = State#state.idx,
     StartTS = os:timestamp(),
-    case Mod:put(Bucket, Key, [], EncodedVal, ModState) of
+    case Mod:put(Bucket, Key, [], EncodedVal, Expiry, ModState) of
         {ok, UpModState} ->
             update_hashtree(Bucket, Key, EncodedVal, State),
             ?INDEX_BIN(Bucket, Key, EncodedVal, put, Idx),
@@ -889,13 +890,14 @@ handle_request(kv_w1c_put_request, Req, _Sender, State=#state{async_put=false}) 
     end;
 %% For now, ignore async_put. This is currently TS-only, and TS
 %% supports neither AAE nor YZ.
-handle_request(kv_w1c_batch_put_request, Req, Sender, State) ->
+handle_request(kv_w1c_batch_put_request, Req, _Sender, State) ->
     ReplicaType = riak_kv_requests:get_replica_type(Req),
     Mod = State#state.mod,
     ModState = State#state.modstate,
-    StartTS = os:timestamp(),
     Objs = riak_kv_requests:get_w1c_objects(Req),
-    Context = {w1c_batch_put, Sender, ReplicaType, Objs, StartTS},
+    Expiry = riak_kv_requests:get_expiry(Req),
+    % Context = {w1c_batch_put, Sender, ReplicaType, Objs, StartTS},
+    Context = [{expiry_secs, Expiry}],
     case Mod:batch_put(Context, Objs, [], ModState) of
         {ok, UpModState} ->
             %% When we support AAE, be sure to call a batch version of

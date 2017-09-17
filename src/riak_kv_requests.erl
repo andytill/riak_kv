@@ -24,8 +24,8 @@
 %% API
 -export([new_put_request/5,
          new_get_request/2,
-         new_w1c_put_request/3,
-         new_w1c_batch_put_request/2,
+         new_w1c_put_request/4,
+         new_w1c_batch_put_request/3,
          new_listkeys_request/3,
          new_listbuckets_request/1,
          new_index_request/4,
@@ -38,6 +38,7 @@
          get_bucket_key/1,
          get_bucket_keys/1,
          get_bucket/1,
+         get_expiry/1,
          get_item_filter/1,
          get_ack_backpressure/1,
          get_query/1,
@@ -96,14 +97,17 @@
 -record(riak_kv_w1c_put_req_v1, {
           bkey :: bucket_key(),
           encoded_obj :: encoded_obj(),
-          type :: replica_type()
+          type :: replica_type(),
+          expiry = infinity :: infintiy|pos_integer()
           % start_time :: non_neg_integer(), Jon to add?
        }).
 
 %% Currently only for timeseries batches
 -record(riak_kv_w1c_batch_put_req_v1, {
           objs :: w1c_objects(),
-          type :: replica_type()}).
+          type :: replica_type(),
+          expiry = infinity :: infintiy|pos_integer()
+       }).
 
 -record(riak_kv_listkeys_req_v3, {
           bucket :: bucket(),
@@ -222,13 +226,13 @@ new_put_request(BKey, Object, ReqId, StartTime, Options) ->
 new_get_request(BKey, ReqId) ->
     #riak_kv_get_req_v1{bkey = BKey, req_id = ReqId}.
 
--spec new_w1c_put_request(bucket_key(), encoded_obj(), replica_type()) -> w1c_put_request().
-new_w1c_put_request(BKey, EncodedObj, ReplicaType) ->
-    #riak_kv_w1c_put_req_v1{bkey = BKey, encoded_obj = EncodedObj, type = ReplicaType}.
+-spec new_w1c_put_request(bucket_key(), encoded_obj(), replica_type(), Expiry::infinity|pos_integer()) -> w1c_put_request().
+new_w1c_put_request(BKey, EncodedObj, ReplicaType, Expiry) ->
+    #riak_kv_w1c_put_req_v1{bkey = BKey, encoded_obj = EncodedObj, type = ReplicaType, expiry = Expiry}.
 
--spec new_w1c_batch_put_request(w1c_objects(), replica_type()) -> w1c_batch_put_request().
-new_w1c_batch_put_request(Objects, ReplicaType) ->
-    #riak_kv_w1c_batch_put_req_v1{objs = Objects, type = ReplicaType}.
+-spec new_w1c_batch_put_request(w1c_objects(), replica_type(), infinity|pos_integer()) -> w1c_batch_put_request().
+new_w1c_batch_put_request(Objects, ReplicaType, Expiry) ->
+    #riak_kv_w1c_batch_put_req_v1{objs = Objects, type = ReplicaType, expiry = Expiry}.
 
 -spec new_listkeys_request(bucket(), item_filter(), UseAckBackpressure::boolean()) -> listkeys_request().
 new_listkeys_request(Bucket, ItemFilter, true) ->
@@ -371,3 +375,8 @@ set_object(#riak_kv_put_req_v1{}=Req, Object) ->
 remove_option(#riak_kv_put_req_v1{options = Options}=Req, Option) ->
     NewOptions = proplists:delete(Option, Options),
     Req#riak_kv_put_req_v1{options = NewOptions}.
+
+get_expiry(#riak_kv_w1c_batch_put_req_v1{expiry = Expiry}) ->
+    Expiry;
+get_expiry(#riak_kv_w1c_put_req_v1{expiry = Expiry}) ->
+    Expiry.
