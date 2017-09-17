@@ -246,7 +246,8 @@ handle_cast({put, Bucket, BucketProps, PartitionIdx, Key, EncodedVal, ReqId, Pre
         true ->
             case store_request_record(ReqId, Rec, State) of
                 {undefined, S} ->
-                    UpdProxies = send_vnodes(Preflist, Proxies, Bucket, Key, EncodedVal, ReqId),
+                    Expiry = proplists:get_value(expiry_secs, BucketProps, infinity),
+                    UpdProxies = send_vnodes(Preflist, Proxies, Bucket, Key, EncodedVal, ReqId, Expiry),
                     postcommit(data_type_by_key(Key), Bucket,
                                maybe_ts_markup(PartitionIdx, Bucket, Key, EncodedVal),
                                BucketProps),
@@ -268,7 +269,8 @@ handle_cast({batch_put, Bucket, BucketProps, EncodedVals, ReqId, PK, Preflist, R
                    true ->
                        case store_request_record(ReqId, Rec, State) of
                            {undefined, S} ->
-                               UpdProxies = batch_send_vnodes(Preflist, Proxies, EncodedVals, ReqId),
+                               Expiry = proplists:get_value(expiry_secs, BucketProps, infinity),
+                               UpdProxies = batch_send_vnodes(Preflist, Proxies, EncodedVals, ReqId, Expiry),
                                postcommit(ts, Bucket, {PK, EncodedVals}, BucketProps),
                                S#state{proxies=UpdProxies};
                            {_, S} ->
@@ -403,29 +405,29 @@ validate_options(NVal, Preflist, Options, BucketProps) ->
             {ok, W, PW}
     end.
 
-send_vnodes(Preflist, Proxies, Bucket, {_PK, LK}, EncodedVal, ReqId) when is_tuple(LK) ->
-    send_vnodes(Preflist, Proxies, Bucket, LK, EncodedVal, ReqId);
-send_vnodes([], Proxies, _Bucket, _Key, _EncodedVal, _ReqId) ->
+send_vnodes(Preflist, Proxies, Bucket, {_PK, LK}, EncodedVal, ReqId, Expiry) when is_tuple(LK) ->
+    send_vnodes(Preflist, Proxies, Bucket, LK, EncodedVal, ReqId, Expiry);
+send_vnodes([], Proxies, _Bucket, _Key, _EncodedVal, _ReqId, _Expiry) ->
     Proxies;
-send_vnodes([{{Idx, Node}, Type}|Rest], Proxies, Bucket, Key, EncodedVal, ReqId) ->
+send_vnodes([{{Idx, Node}, Type}|Rest], Proxies, Bucket, Key, EncodedVal, ReqId, Expiry) ->
     {Proxy, NewProxies} = get_proxy(Idx, Proxies),
-    Message = riak_kv_requests:new_w1c_put_request({Bucket, Key}, EncodedVal, Type),
+    Message = riak_kv_requests:new_w1c_put_request({Bucket, Key}, EncodedVal, Type, Expiry),
     gen_fsm:send_event(
         {Proxy, Node},
         riak_core_vnode_master:make_request(Message, {raw, ReqId, self()}, Idx)
     ),
-    send_vnodes(Rest, NewProxies, Bucket, Key, EncodedVal, ReqId).
+    send_vnodes(Rest, NewProxies, Bucket, Key, EncodedVal, ReqId, Expiry).
 
-batch_send_vnodes([], Proxies, _EncodedVals, _ReqId) ->
+batch_send_vnodes([], Proxies, _EncodedVals, _ReqId, _Expiry) ->
     Proxies;
-batch_send_vnodes([{{Idx, Node}, Type}|Rest], Proxies, EncodedVals, ReqId) ->
+batch_send_vnodes([{{Idx, Node}, Type}|Rest], Proxies, EncodedVals, ReqId, Expiry) ->
     {Proxy, NewProxies} = get_proxy(Idx, Proxies),
-    Message = riak_kv_requests:new_w1c_batch_put_request(EncodedVals, Type),
+    Message = riak_kv_requests:new_w1c_batch_put_request(EncodedVals, Type, Expiry),
     gen_fsm:send_event(
         {Proxy, Node},
         riak_core_vnode_master:make_request(Message, {raw, ReqId, self()}, Idx)
     ),
-    batch_send_vnodes(Rest, NewProxies, EncodedVals, ReqId).
+    batch_send_vnodes(Rest, NewProxies, EncodedVals, ReqId, Expiry).
 
 get_proxy(Idx, Proxies) ->
     case ?DICT_TYPE:find(Idx, Proxies) of
